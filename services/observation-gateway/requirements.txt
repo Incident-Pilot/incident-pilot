@@ -1,0 +1,3 @@
+pydantic==2.9.2
+httpx==0.27.2
+# FastAPI, kubernetes client, sqlalchemy/psycopg, redis etc. added in later tasks
