@@ -3,4 +3,5 @@ httpx==0.27.2
 kubernetes==35.0.0
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
-# sqlalchemy/psycopg, redis etc. added in later tasks
+asyncpg==0.31.0
+# redis etc. added in a later task

@@ -10,7 +10,21 @@ def client():
     # module-level `app` singleton in app.main would otherwise leak state
     # between tests since InMemoryIncidentStore/InMemoryObservationStore
     # are plain dicts with no reset hook.
-    return TestClient(create_app())
+    app = create_app()
+    # A firing alert now also kicks off the step-10 Context Builder as a
+    # background task, which TestClient runs synchronously before the
+    # request returns. create_app() wires the real Prometheus/Loki/Tempo/
+    # Kubernetes clients at their real (in-cluster-only) URLs — reachable
+    # in prod, but here that means slow/hanging DNS lookups against
+    # unreachable *.svc.cluster.local hosts. Webhook tests only care about
+    # normalization/correlation, not live telemetry collection, so blank
+    # the clients out here; the Context Builder's None-client path reports
+    # each source UNAVAILABLE immediately instead of attempting real I/O.
+    app.state.prometheus_client = None
+    app.state.loki_client = None
+    app.state.tempo_client = None
+    app.state.kubernetes_client = None
+    return TestClient(app)
 
 
 def firing_payload(**overrides):
@@ -145,4 +159,69 @@ def test_incident_visible_via_incident_store(client):
     incident = asyncio.run(store.get(incident_id))
     assert incident is not None
     assert incident.status.value == "open"
-    assert incident.current_phase.value == "detected"
+    # step 10: the Context Builder background task runs to completion
+    # (TestClient executes background tasks synchronously) and always
+    # ends with READY_FOR_INVESTIGATION, even with every telemetry source
+    # unavailable (this fixture blanks out all four adapter clients) —
+    # "no data collected" and "data collected but nothing found" both
+    # still mean the incident is ready to be looked at.
+    assert incident.current_phase.value == "ready_for_investigation"
+
+
+# --- step 9: cross-delivery correlation (spec section 7) -------------------
+
+
+def test_same_alert_refiring_in_a_separate_delivery_reuses_the_incident(client):
+    first = client.post("/webhooks/alertmanager", json=firing_payload())
+    second = client.post("/webhooks/alertmanager", json=firing_payload())
+
+    first_incident_id = first.json()["incident"]["incident_id"]
+    second_incident_id = second.json()["incident"]["incident_id"]
+
+    assert first_incident_id == second_incident_id
+    store = client.app.state.incident_store
+    import asyncio
+
+    all_incidents = asyncio.run(store.list_all())
+    assert len(all_incidents) == 1
+
+
+def test_related_alert_in_a_separate_delivery_merges_into_same_incident(client):
+    first = client.post("/webhooks/alertmanager", json=firing_payload())
+    first_incident_id = first.json()["incident"]["incident_id"]
+
+    latency_payload = firing_payload(
+        groupLabels={"alertname": "HighLatency", "namespace": "cloudmart-prod"},
+        commonLabels={"alertname": "HighLatency", "namespace": "cloudmart-prod"},
+    )
+    latency_payload["alerts"] = [
+        {
+            "status": "firing",
+            "labels": {
+                "alertname": "HighLatency",
+                "severity": "warning",
+                "namespace": "cloudmart-prod",
+                "service": "order-service",
+            },
+            "annotations": {},
+            "startsAt": "2026-08-19T09:35:00Z",
+            "endsAt": "0001-01-01T00:00:00Z",
+        }
+    ]
+    second = client.post("/webhooks/alertmanager", json=latency_payload)
+    body = second.json()
+
+    assert body["incident"]["incident_id"] == first_incident_id
+    assert sorted(body["incident"]["initial_alerts"]) == ["HighHTTPErrorRate", "HighLatency"]
+    assert body["incident"]["severity"] == "critical"
+
+
+def test_unrelated_service_in_a_separate_delivery_creates_a_new_incident(client):
+    first = client.post("/webhooks/alertmanager", json=firing_payload())
+    first_incident_id = first.json()["incident"]["incident_id"]
+
+    other_payload = firing_payload()
+    other_payload["alerts"][0]["labels"]["service"] = "product-service"
+    second = client.post("/webhooks/alertmanager", json=other_payload)
+
+    assert second.json()["incident"]["incident_id"] != first_incident_id

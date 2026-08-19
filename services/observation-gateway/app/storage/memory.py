@@ -8,9 +8,10 @@ satisfy the Protocols in interfaces.py so main.py can swap this out for
 the Postgres-backed stores later without changing any caller.
 """
 
+from datetime import datetime
 from typing import Dict, List, Optional
 
-from shared.models import Incident, Observation
+from shared.models import Evidence, Incident, IncidentStatus, Observation
 
 
 class InMemoryObservationStore:
@@ -43,3 +44,29 @@ class InMemoryIncidentStore:
 
     async def list_all(self) -> List[Incident]:
         return list(self._by_id.values())
+
+    async def find_correlation_candidates(
+        self, namespace: Optional[str], services: List[str], since: datetime
+    ) -> List[Incident]:
+        if not services:
+            return []
+        service_set = set(services)
+        return [
+            incident
+            for incident in self._by_id.values()
+            if incident.status == IncidentStatus.OPEN
+            and incident.affected_namespace == namespace
+            and service_set.intersection(incident.affected_services)
+            and incident.updated_at >= since
+        ]
+
+
+class InMemoryEvidenceStore:
+    def __init__(self) -> None:
+        self._by_id: Dict[str, Evidence] = {}
+
+    async def save(self, evidence: Evidence) -> None:
+        self._by_id[evidence.evidence_id] = evidence
+
+    async def list_by_incident(self, incident_id: str) -> List[Evidence]:
+        return [e for e in self._by_id.values() if e.incident_id == incident_id]

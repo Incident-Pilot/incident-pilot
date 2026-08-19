@@ -39,5 +39,23 @@ class Settings:
     # No live API surfaces this name anywhere, so it is a static config value.
     cluster_name: str = os.getenv("CLUSTER_NAME", "cloudmart-k3s")
 
+    # Empty by default -> main.py's lifespan keeps the in-memory stores
+    # (dev/test behavior unchanged). Set to a real DSN (step 15's k8s
+    # manifests source this from a Secret, never commit a real one here)
+    # to switch the app over to Postgres-backed persistence on startup.
+    postgres_dsn: str = os.getenv("POSTGRES_DSN", "")
+
+    # spec section 7: deterministic incident correlation window. A firing
+    # alert only merges into an existing OPEN incident if that incident's
+    # namespace/service overlap AND it was last updated within this many
+    # minutes — otherwise a new incident is created. Same 15-minute
+    # default the spec suggests for the Context Builder's lookback window
+    # (section 9), reused here since both express "still the same event."
+    correlation_window_minutes: float = float(os.getenv("CORRELATION_WINDOW_MINUTES", "15"))
+
+    # spec section 9's suggested default lookback for the Incident Context
+    # Builder: how far back from "now" to pull metrics/logs/traces/events.
+    context_window_minutes: float = float(os.getenv("CONTEXT_WINDOW_MINUTES", "15"))
+
 
 settings = Settings()

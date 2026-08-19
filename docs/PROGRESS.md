@@ -20,9 +20,9 @@ task so a new session can pick up without re-deriving context.
 - [x] 12. Test Kubernetes adapter — **DONE this task** (mocked; live check script provided)
 - [x] 13. Implement Alertmanager webhook — **DONE this task**
 - [x] 14. Implement normalization — **DONE this task**
-- [ ] 15. Implement PostgreSQL persistence
-- [ ] 16. Implement incident correlation
-- [ ] 17. Implement context builder
+- [x] 15. Implement PostgreSQL persistence — **DONE this task**
+- [x] 16. Implement incident correlation — **DONE this task**
+- [x] 17. Implement context builder — **DONE this task**
 - [ ] 18. Implement topology
 - [ ] 19. Implement deployment context
 - [ ] 20. Implement security context
@@ -308,13 +308,267 @@ task so a new session can pick up without re-deriving context.
   doesn't exist until step 8's Postgres layer. Flag if you want this
   changed once Postgres is in place.
 
-### Task 7 — TBD
+### Task 7 — PostgreSQL persistence (DONE)
 
-Per the method sequence: step 15 (PostgreSQL persistence) is next —
-implement Postgres-backed `ObservationStore`/`IncidentStore` against the
-Protocols already defined in `app/storage/interfaces.py`, wire
-`create_app()` to use them instead of the in-memory versions, and add the
-`incidents`/`observations`/`evidence`/`deployments`/`service_topology`
-tables (spec section 11). Redis buffering (also spec section 11) can
-either land in this task or be split into its own — worth confirming
-which you'd prefer before starting.
+- **Scoping call**: spec section 11 groups Postgres and Redis under one
+  "Storage" requirement, but the numbered build order names this step
+  "PostgreSQL persistence layer" specifically. Built Postgres only this
+  task; Redis buffering is deferred until a concrete resilience scenario
+  needs it (spec section 13's "don't lose observations when a backend is
+  briefly unreachable" is about the *adapters*, not this store, so it
+  doesn't obviously belong here either). Flag if you want it pulled
+  forward.
+- `app/storage/postgres/schema.sql`: all five spec-section-11 tables
+  created as one idempotent migration (`CREATE TABLE IF NOT EXISTS`) —
+  `incidents`, `observations`, `evidence`, `deployments`,
+  `service_topology`. Only `incidents`/`observations` have a Python store
+  implementation this task; the other three tables exist now purely so
+  steps 10-12 don't need a schema change later, nothing writes to them
+  yet. `observations.incident_id` is a nullable FK to `incidents` (`ON
+  DELETE SET NULL`) — verified live that it actually rejects an
+  observation pointing at a nonexistent incident
+  (`test_observation_fk_rejects_unknown_incident_id`).
+- `app/storage/postgres/pool.py`: `asyncpg` pool + a per-connection jsonb
+  codec (`set_type_codec`) so `labels`/`metadata`/`affected_services`/etc.
+  pass through as plain Python dict/list — store code never touches
+  `json.dumps`/`loads` directly.
+- `PostgresIncidentStore` / `PostgresObservationStore`
+  (`app/storage/postgres/incident_store.py` /
+  `observation_store.py`): implement the exact `IncidentStore`/
+  `ObservationStore` Protocols from `app/storage/interfaces.py` — same
+  interface the in-memory stores satisfy, so nothing above the store
+  layer (the webhook handler) changed at all. `save()` is an upsert
+  (`ON CONFLICT ... DO UPDATE`) on both.
+- `app/main.py`: added a `lifespan` handler — if `settings.postgres_dsn`
+  (env `POSTGRES_DSN`) is set, it opens the pool, applies the schema, and
+  swaps `app.state.*_store` to the Postgres versions on startup; closes
+  the pool on shutdown. Empty DSN (the default, and what every existing
+  test uses) leaves the step-7 in-memory stores untouched — **zero
+  changes needed to the 82 existing tests**, verified by rerunning them
+  unmodified after this change.
+- **Verified against a real, disposable local Postgres 14 instance**, not
+  just mocks (asyncpg needs real SQL/type-codec behavior proven, a mock
+  would just be asserting my own assumptions back at me):
+  - `services/observation-gateway/tests/test_postgres_store_integration.py`
+    — 6 tests (incident round-trip, get-missing returns None, save is a
+    true upsert, observation round-trip preserves JSONB + correlation
+    fields, FK-linked lookup by incident, FK rejects an unknown
+    incident_id) run via `pytest.mark.anyio` (the `anyio` pytest plugin
+    ships with `anyio` itself, already a transitive dependency via
+    Starlette — no new test dependency added). Skipped by default
+    (`pytestmark = pytest.mark.skipif(not POSTGRES_DSN, ...)`) so the
+    normal `pytest` run stays fast and DB-free, same pattern as the
+    `live_check_*.py` scripts for the other adapters. All 6 passed when
+    actually run against `postgresql://incidentpilot@127.0.0.1:5433/incidentpilot`.
+  - Beyond the test suite: started the real `uvicorn` server with
+    `POSTGRES_DSN` pointed at that same instance, POSTed a real
+    Alertmanager webhook payload to it, then independently queried the
+    tables with raw `psql` (not through the app) and confirmed the
+    incident and observation rows, JSONB `labels`, and the FK link all
+    landed correctly — then killed the server process and re-queried to
+    confirm the data survives (unlike the in-memory store, which loses
+    everything on restart — this was the actual point of this task).
+  - The scratch Postgres instance used for this was ephemeral (a local
+    `initdb` under the session's scratchpad dir, port 5433) and has been
+    stopped; it was not the CloudMart cluster's Postgres, since no live
+    cluster is reachable from this sandbox (still unresolved from Task
+    6 — see that entry).
+- `asyncpg==0.31.0` added to `services/observation-gateway/requirements.txt`
+  and root `requirements-dev.txt`.
+- Full suite: **82 passed, 6 skipped** (the 6 skips are the Postgres
+  integration tests, skipped because this environment has no
+  `POSTGRES_DSN` configured by default) — `pytest shared/tests
+  services/observation-gateway/tests -v`.
+
+### Task 8 — Incident correlation/deduplication (DONE)
+
+- Replaced the naive "one incident per webhook delivery" behavior from
+  Task 6 with the real spec-section-7 rule, in a new
+  `app/correlation/incident_correlator.py`
+  (`correlate_or_create_incident()`): a batch of firing observations
+  merges into an existing **OPEN** incident if that incident's
+  `affected_namespace` matches, at least one `affected_services` entry
+  overlaps, and it was `updated_at` within `settings.correlation_window_minutes`
+  (default 15, env `CORRELATION_WINDOW_MINUTES`) — otherwise a new
+  incident is created, same as before. No AI/ML, no fuzzy matching, per
+  the spec's explicit constraint. On merge: `affected_services` and
+  `initial_alerts` are unioned (no duplicates), `severity` becomes the
+  higher of the two, `updated_at` bumps to now — `title`/`created_at`/
+  `incident_id` are untouched (the incident's identity doesn't change).
+  **Deliberately does not touch `status`/resolution** — a resolved alert
+  still doesn't close or affect an incident at all; that's lifecycle
+  management, a different concern from correlation, and stays out of
+  scope here.
+- Added `IncidentStore.find_correlation_candidates(namespace, services,
+  since)` to the Protocol (`app/storage/interfaces.py`) plus both
+  implementations: `InMemoryIncidentStore` filters in Python;
+  `PostgresIncidentStore` does it in SQL (`status = 'open' AND
+  affected_namespace IS NOT DISTINCT FROM $1 AND updated_at >= $2 AND
+  affected_services ?| $3::text[]`) — the `?|` jsonb operator checks
+  array-element overlap directly, no application-side filtering needed.
+  Both return `[]` immediately if `services` is empty, since namespace
+  alone was judged too broad a match to merge safely (e.g. two
+  completely unrelated alerts that both happen to lack a service label
+  would otherwise collide into one incident).
+- Tie-break when more than one OPEN incident matches: the most recently
+  `updated_at` one wins (`test_multiple_candidates_tie_break_to_most_recently_updated`).
+- `app/api/webhooks.py` simplified: `_build_incident`/`_highest_severity`
+  moved into the correlator module (same logic, now reused for both the
+  "new incident" and "merge" paths); the handler just calls
+  `correlate_or_create_incident()` once per delivery.
+- 12 new unit tests (`test_incident_correlator.py`, in-memory store, no DB
+  needed): first delivery creates, second delivery same
+  namespace/service merges, exact duplicate refiring doesn't duplicate
+  `initial_alerts`, different namespace/service each create separately,
+  no-derivable-service never merges, outside the time window creates
+  separately, a resolved incident is never a merge candidate, tie-break
+  logic. Plus 3 new webhook-level tests
+  (`test_alertmanager_webhook.py`) proving this works through the actual
+  HTTP endpoint across *separate* POST requests, not just within one
+  payload. Plus 5 new Postgres integration tests for
+  `find_correlation_candidates` itself (namespace/service/window
+  matching, excludes resolved, excludes stale, requires service overlap,
+  empty services short-circuits) — all run and passed against the same
+  real local Postgres instance from Task 7. Full suite: **94 passed, 11
+  skipped** (11 = all Postgres integration tests, skipped without
+  `POSTGRES_DSN`) in-memory; **11 passed** when the Postgres-only file is
+  run with `POSTGRES_DSN` set.
+- **Verified live, end to end, reproducing the exact gap flagged at the
+  end of Task 7**: started the real server against a real (truncated)
+  Postgres, POSTed the same alert twice as two separate HTTP requests
+  (previously: 2 incidents — now: 1, confirmed via raw `psql`, not just
+  the app's own response), then a related alert on the same service as a
+  third separate request (merged into the same incident,
+  `initial_alerts` grew to both names), then an alert on a *different*
+  service as a fourth request (correctly created a second, separate
+  incident). Killed the server and stopped the scratch Postgres
+  afterward — nothing left running.
+
+### Task 9 — Incident Context Builder (DONE)
+
+- New `app/context/incident_context_builder.py`
+  (`IncidentContextBuilder.build(incident)`), triggered from
+  `app/api/webhooks.py` via FastAPI `BackgroundTasks` after a firing
+  webhook creates/merges an incident (spec section 5's "kicks off context
+  collection") — the webhook still returns 202 immediately (~50ms,
+  verified live below); collection happens after the response is sent so
+  a slow/unreachable backend can never turn into a webhook timeout.
+- Pulls a `settings.context_window_minutes`-wide window (default 15,
+  spec section 9's suggestion) of: the incident's already-linked alert
+  Observations (cited as `EvidenceType.ALERT`), Prometheus metrics, Loki
+  error logs, Tempo error spans, and Kubernetes events + pod status. Sets
+  `current_phase = COLLECTING_CONTEXT` at the start and
+  `READY_FOR_INVESTIGATION` at the end — **always** the end state, even
+  if every single source failed (verified both by test and live run
+  below), since "no data collected" still means the incident is ready to
+  be looked at.
+- **Query selection decided now** (deferred since Task 2):
+  `_METRIC_PROBES` in the context builder — 4 PromQL templates
+  (`kube_pod_container_status_restarts_total`,
+  `container_cpu_usage_seconds_total`,
+  `container_memory_working_set_bytes`,
+  `traefik_service_requests_total`), a namespace-scoped Loki error-keyword
+  query, and a Tempo tag search per affected service (capped to 5 traces
+  fetched per service). **None of these are confirmed against the real
+  cluster** — see `docs/LIVE_CLUSTER_VERIFICATION.md` (new this task),
+  which is the instruction set for closing that out from the EC2 box.
+  Nothing else depends on the exact query strings, so wrong ones are a
+  one-line fix once verified.
+- 4 new normalizers (`app/normalizers/{prometheus,loki,tempo,kubernetes}_normalizer.py`)
+  turn each adapter's already-parsed shape (`LogEntry`/`Span`/`K8sEvent`/
+  `PodSummary`, all built in Tasks 2-5) into canonical Observations. This
+  is also where Task 5's deferred K8s event severity mapping
+  (`Normal`->INFO, `Warning`->WARNING) finally happens. Deliberately
+  conservative: no severity inference from free-text log messages, no
+  latency-threshold judgment on spans — only structural mapping of
+  fields the source already provided. Logs capped at 50 entries/service
+  (spec section 5's "don't dump unbounded raw log volume").
+- Every Observation collected gets exactly one `Evidence` record citing
+  it (`raw_reference.query` = the real query/reference used) — this is
+  what closes spec section 8's provenance requirement for real telemetry,
+  not just the Alertmanager-sourced observations from Task 6.
+- New `EvidenceStore` Protocol (`app/storage/interfaces.py`) +
+  `InMemoryEvidenceStore` + `PostgresEvidenceStore` — same
+  Protocol-then-swap pattern as Task 7/8's Observation/Incident stores.
+  `app/main.py` now also constructs the four adapter clients at startup
+  (Kubernetes client construction is wrapped in try/except: no reachable
+  kubeconfig -> `None`, and the Context Builder treats a `None` client as
+  source `UNAVAILABLE` rather than crashing).
+- **Resilience (spec section 13) is the actual point of this task, and is
+  tested three ways, not just asserted:**
+  - 9 unit tests (`test_incident_context_builder.py`, mocked adapters):
+    one source unavailable doesn't block the others, a timeout is
+    reported not raised, a missing Kubernetes client doesn't crash the
+    app, all four sources failing still reaches
+    `READY_FOR_INVESTIGATION`, every Evidence cites a real Observation,
+    and running `build()` twice doesn't duplicate the alert Evidence
+    (idempotency, since correlation (Task 8) can call this multiple
+    times as an incident gets merged into across deliveries).
+  - 20 more unit tests across the four normalizers
+    (`test_{prometheus,loki,tempo,kubernetes}_normalizer.py`).
+  - **Verified live against genuinely unreachable hosts** — not mocks:
+    started the real server with `POSTGRES_DSN` pointed at a real local
+    Postgres but left `PROMETHEUS_BASE_URL`/`LOKI_BASE_URL`/
+    `TEMPO_BASE_URL` at their real (in-cluster-only, therefore actually
+    unreachable from this sandbox) defaults, and the Kubernetes client
+    pointed at the same unreachable EKS ARN from Task 6. POSTed a real
+    webhook — response returned in the ~50ms range as expected. Polled
+    the incident's `current_phase` in Postgres every 5s: it sat in
+    `collecting_context` for ~25s (all four backends genuinely timing
+    out/failing to resolve, one after another) then correctly reached
+    `ready_for_investigation`. Confirmed via `psql` that the alert
+    Evidence (`ev-...`, type=alert, source=alertmanager,
+    "Alert 'HighHTTPErrorRate' fired on order-service") was persisted
+    despite all telemetry sources failing, and the uvicorn log showed no
+    unhandled exception. This is the exact "Tempo mid-restart-loop, still
+    get partial context" scenario from the original spec's Step 0,
+    proven with a real (if accidental) unreachable-backend condition
+    rather than a mock standing in for one.
+  - A gotcha found and fixed along the way: the webhook test fixture
+    originally used `create_app()` unmodified, which wires the *real*
+    adapter clients at their real cluster-only URLs — since
+    `TestClient` runs `BackgroundTasks` synchronously before returning,
+    every firing-alert webhook test started making real network calls
+    against `*.svc.cluster.local` hostnames, which resolve very slowly
+    on this sandbox (looked like a hang, not a fast NXDOMAIN — a full
+    `pytest` run exceeded 120s and had to be killed). Fixed by blanking
+    out all four `app.state.*_client` attributes to `None` in the
+    webhook test fixture — the Context Builder's already-tested
+    None-client path reports each source `UNAVAILABLE` immediately, no
+    network I/O at all. Worth knowing if you add more webhook tests:
+    the fixture already handles this, no action needed, but don't
+    remove those four `None` assignments.
+  - 2 more Postgres integration tests
+    (`test_postgres_store_integration.py`): `PostgresEvidenceStore`
+    round-trip (including `RawReference` round-tripping through JSONB)
+    and upsert. Full Postgres-only suite: 13 passed.
+- One existing test's assertion was stale, not wrong: `test_incident_visible_via_incident_store`
+  expected `current_phase == "detected"`, which was correct before this
+  task (nothing advanced the phase past DETECTED) but is now genuinely
+  wrong — the Context Builder runs synchronously inside that same test
+  (via `TestClient`'s background-task execution) and correctly advances
+  it to `ready_for_investigation`. Updated the assertion; this was a
+  fixture catching up to new correct behavior, not a bug.
+- Full in-memory suite: **123 passed, 13 skipped** (13 = all Postgres
+  integration tests, skipped without `POSTGRES_DSN`) in 8s —
+  `pytest shared/tests services/observation-gateway/tests -v`.
+- **Deliberately NOT built this task** (spec section 9 lists them, but
+  the numbered build order splits them out): deployment status/info
+  (step 19/12 — needs the deployment-context collector, which doesn't
+  exist) and service topology (step 18/11 — needs the dependency graph,
+  which doesn't exist). The Context Builder does not attempt either.
+
+### Task 10 — TBD
+
+Per the method sequence, step 18 (service topology) is next. Still
+outstanding, now written up as an actual runnable procedure rather than
+just a note: `docs/LIVE_CLUSTER_VERIFICATION.md` (new this task) is the
+step-by-step for verifying all four adapters — and, critically, the
+`_METRIC_PROBES`/log query/trace search added in this task — against the
+real CloudMart cluster from the EC2 box. Two things flagged as
+highest-value to check first: whether application-level traces exist in
+Tempo *at all* (a separate inspection found no OpenTelemetry SDK in the
+CloudMart app code, which would mean Tempo has nothing to find regardless
+of adapter correctness), and Tempo's live restart status
+(`kubectl describe pod tempo-0 -n observability`), since the Context
+Builder's resilience path was specifically built to tolerate that.
