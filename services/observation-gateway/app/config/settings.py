@@ -35,5 +35,9 @@ class Settings:
     )
     http_timeout_seconds: float = float(os.getenv("HTTP_TIMEOUT_SECONDS", "5.0"))
 
+    # spec section 4's illustrative Observation carries cluster: "cloudmart-k3s".
+    # No live API surfaces this name anywhere, so it is a static config value.
+    cluster_name: str = os.getenv("CLUSTER_NAME", "cloudmart-k3s")
+
 
 settings = Settings()

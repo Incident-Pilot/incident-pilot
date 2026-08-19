@@ -1,3 +1,6 @@
 pydantic==2.9.2
 httpx==0.27.2
-# FastAPI, kubernetes client, sqlalchemy/psycopg, redis etc. added in later tasks
+kubernetes==35.0.0
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+# sqlalchemy/psycopg, redis etc. added in later tasks
