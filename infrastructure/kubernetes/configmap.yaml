@@ -1,0 +1,15 @@
+# Non-sensitive configuration. Sensitive values (Postgres DSN, gateway API
+# key) go in Secrets — see postgres.yaml and deployment.yaml's comments
+# for the exact `kubectl create secret` bootstrap commands, never
+# committed here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: observation-gateway-config
+  namespace: incident-pilot-ecommerce
+data:
+  PROMETHEUS_BASE_URL: "http://kube-prom-kube-prometheus-prometheus.observability.svc.cluster.local:9090"
+  LOKI_BASE_URL: "http://loki.observability.svc.cluster.local:3100"
+  TEMPO_BASE_URL: "http://tempo.observability.svc.cluster.local:3200"
+  CLUSTER_NAME: "cloudmart-k3s"
+  DEFAULT_NAMESPACE: "cloudmart-prod"

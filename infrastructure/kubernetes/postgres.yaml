@@ -1,0 +1,105 @@
+# Postgres for the observation-gateway. A plain Deployment + PVC, not a
+# StatefulSet — this is a single-replica, non-HA database (Phase 2A scope,
+# single-node k3s), so StatefulSet's stable-identity/ordered-scaling
+# guarantees buy nothing here that a Deployment doesn't already give with
+# less complexity. `strategy: Recreate` matters, though: with a single
+# ReadWriteOnce volume, a RollingUpdate would try to schedule the new pod
+# before killing the old one and fail to mount, so this must not be
+# the default RollingUpdate strategy.
+#
+# Password/DSN come from a `postgres-credentials` Secret this manifest
+# does NOT create — per spec section 12 ("never commit credentials"),
+# create it out-of-band before applying this file:
+#
+#   kubectl create secret generic postgres-credentials \
+#     -n incident-pilot-ecommerce \
+#     --from-literal=password='<a strong password>' \
+#     --from-literal=dsn='postgresql://incidentpilot:<same password>@postgres.incident-pilot-ecommerce.svc.cluster.local:5432/incidentpilot'
+#
+# Resource requests/limits sized per the original node-memory guidance
+# (t3.medium, ~3.75GiB allocatable, already running the observability
+# stack + 5 CloudMart services): Postgres ~256-512Mi.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: incident-pilot-ecommerce
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: incident-pilot-ecommerce
+  labels:
+    app: postgres
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: "incidentpilot"
+            - name: POSTGRES_USER
+              value: "incidentpilot"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: password
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+          resources:
+            requests:
+              cpu: 50m
+              memory: 256Mi
+            limits:
+              cpu: 250m
+              memory: 512Mi
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "incidentpilot"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "incidentpilot"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: postgres-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: incident-pilot-ecommerce
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  type: ClusterIP

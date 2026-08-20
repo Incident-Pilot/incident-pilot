@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: incident-pilot-ecommerce
+  labels:
+    app: incidentpilot
+    environment: production
