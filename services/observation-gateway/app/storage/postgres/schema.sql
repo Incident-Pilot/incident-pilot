@@ -70,6 +70,11 @@ CREATE TABLE IF NOT EXISTS deployments (
     success            BOOLEAN,
     metadata           JSONB NOT NULL DEFAULT '{}'
 );
+-- Added step 12: spec section 5 lists "branch" as a required deployment
+-- field alongside commit SHA, but the original migration (Task 7) missed
+-- it. ADD COLUMN IF NOT EXISTS keeps this migration idempotent for
+-- databases that already ran the CREATE TABLE above.
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS branch TEXT;
 CREATE INDEX IF NOT EXISTS idx_deployments_service ON deployments(service);
 
 CREATE TABLE IF NOT EXISTS service_topology (
