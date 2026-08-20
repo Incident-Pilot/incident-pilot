@@ -8,12 +8,19 @@ entire system" applies equally here).
 
 Loki's raw response shape only gives you a per-stream label set plus raw
 log lines — it does not label-name-guarantee "namespace"/"pod"/"container"/
-"service" the way spec section 13 asks us to preserve. Promtail's actual
-label conventions on this cluster have NOT been verified yet (see
-docs/PROGRESS.md Task 3 note), so `parse_entries()` resolves each of those
-fields from a prioritized list of common Promtail/k8s label names rather
-than assuming one fixed key — and always keeps the full raw label set too,
-so nothing is silently dropped if the real convention differs.
+"service" the way spec section 13 asks us to preserve, so `parse_entries()`
+resolves each of those fields from a prioritized list of candidate
+Promtail/k8s label names rather than assuming one fixed key — and always
+keeps the full raw label set too, so nothing is silently dropped if a
+future log source disagrees.
+
+**CONFIRMED against the live CloudMart cluster (2026-08-20)**:
+`namespace`/`pod`/`container` resolve via their direct label names;
+`service` resolves via the `app` label. A `service_name` label also
+exists on this cluster's Promtail output but wasn't in the candidate list
+at verification time — added below as a second candidate purely for
+future robustness; it's currently redundant since `app` already matches
+first and always agrees with it here.
 
 Every call returns an AdapterResult instead of raising (spec section 29).
 """
@@ -32,7 +39,14 @@ from .base import AdapterResult, SourceStatus
 _NAMESPACE_LABEL_CANDIDATES = ("namespace", "kubernetes_namespace_name", "k8s_namespace")
 _POD_LABEL_CANDIDATES = ("pod", "kubernetes_pod_name", "pod_name")
 _CONTAINER_LABEL_CANDIDATES = ("container", "kubernetes_container_name", "container_name")
-_SERVICE_LABEL_CANDIDATES = ("service", "app", "app_kubernetes_io_name", "job", "container")
+_SERVICE_LABEL_CANDIDATES = (
+    "service",
+    "app",
+    "service_name",
+    "app_kubernetes_io_name",
+    "job",
+    "container",
+)
 
 
 def _first_present(labels: Dict[str, str], candidates: tuple) -> Optional[str]:

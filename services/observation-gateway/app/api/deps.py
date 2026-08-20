@@ -5,7 +5,14 @@ up (in-memory today, Postgres from step 8 on)."""
 from fastapi import Request
 
 from app.context.incident_context_builder import IncidentContextBuilder
-from app.storage.interfaces import EvidenceStore, IncidentStore, ObservationStore
+from app.storage.interfaces import (
+    DeploymentStore,
+    EvidenceStore,
+    IncidentStore,
+    ObservationStore,
+    TopologyStore,
+)
+from app.topology.service_topology_builder import ServiceTopologyBuilder
 
 
 def get_observation_store(request: Request) -> ObservationStore:
@@ -18,6 +25,14 @@ def get_incident_store(request: Request) -> IncidentStore:
 
 def get_evidence_store(request: Request) -> EvidenceStore:
     return request.app.state.evidence_store
+
+
+def get_topology_store(request: Request) -> TopologyStore:
+    return request.app.state.topology_store
+
+
+def get_deployment_store(request: Request) -> DeploymentStore:
+    return request.app.state.deployment_store
 
 
 def get_context_builder(request: Request) -> IncidentContextBuilder:
@@ -35,4 +50,14 @@ def get_context_builder(request: Request) -> IncidentContextBuilder:
         observation_store=state.observation_store,
         evidence_store=state.evidence_store,
         incident_store=state.incident_store,
+        deployment_store=state.deployment_store,
+    )
+
+
+def get_topology_builder(request: Request) -> ServiceTopologyBuilder:
+    state = request.app.state
+    return ServiceTopologyBuilder(
+        kubernetes=state.kubernetes_client,
+        tempo=state.tempo_client,
+        topology_store=state.topology_store,
     )

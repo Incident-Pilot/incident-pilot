@@ -23,6 +23,7 @@ from typing import List
 
 from fastapi import APIRouter, BackgroundTasks, Depends
 
+from app.api.auth import require_api_key
 from app.api.deps import get_context_builder, get_incident_store, get_observation_store
 from app.config.settings import settings
 from app.context.incident_context_builder import IncidentContextBuilder
@@ -32,7 +33,7 @@ from app.normalizers.alertmanager_normalizer import normalize_alert
 from app.storage.interfaces import IncidentStore, ObservationStore
 from shared.models import Incident, Observation
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_api_key)])
 
 
 async def _run_context_builder(context_builder: IncidentContextBuilder, incident: Incident) -> None:

@@ -7,12 +7,12 @@ the CloudMart k3s cluster (2026-08-13, `kubectl get svc -n observability
 this service is intended to run (spec section 39). Override via env vars
 for local/port-forwarded testing.
 
-NOT YET VERIFIED: whether any auth sits in front of these query APIs.
-`kubectl get secrets -n observability` showed only TLS/webhook certs for
-the Prometheus operator's admission webhook and Grafana's admin login —
-nothing indicating basic auth on the Prometheus/Loki/Tempo query
-endpoints themselves. Treating them as unauthenticated for now; revisit
-if a live call comes back 401/403.
+Auth: live verification (2026-08-20, docs/LIVE_CLUSTER_VERIFICATION.md)
+made real calls against Prometheus, Loki, Tempo, and the Kubernetes API
+via these endpoints/ClusterIPs and every one came back `available` — no
+401/403 encountered. Treating them as unauthenticated is confirmed
+correct in practice, not just an untested assumption; revisit only if
+that ever changes (e.g. an auth proxy gets added in front of one later).
 """
 
 import os
@@ -56,6 +56,18 @@ class Settings:
     # spec section 9's suggested default lookback for the Incident Context
     # Builder: how far back from "now" to pull metrics/logs/traces/events.
     context_window_minutes: float = float(os.getenv("CONTEXT_WINDOW_MINUTES", "15"))
+
+    # spec section 1: the CloudMart application namespace. GET /topology
+    # (step 11) builds its graph for this namespace since topology isn't
+    # scoped to a single incident the way context collection is.
+    default_namespace: str = os.getenv("DEFAULT_NAMESPACE", "cloudmart-prod")
+
+    # spec section 12: "do not expose this unauthenticated." Sourced from
+    # a Kubernetes Secret mounted as an env var (step 15's manifests) —
+    # never a real value in this repo. Empty by default, which
+    # app/api/auth.py treats as "reject everything" (503), not "allow
+    # everything" — a missing Secret must fail closed, not open.
+    api_key: str = os.getenv("GATEWAY_API_KEY", "")
 
 
 settings = Settings()

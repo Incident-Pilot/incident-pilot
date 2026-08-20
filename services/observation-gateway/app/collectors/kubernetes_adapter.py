@@ -20,6 +20,13 @@ into the canonical `Severity` enum (critical/warning/info/unknown) — that
 mapping is a normalization decision that belongs to the normalizer layer
 (step 14), not this adapter (spec section 7: the gateway collects/
 normalizes, later stages reason).
+
+**CONFIRMED against the live cluster (2026-08-20)**: every method here
+returned `available` with real `cloudmart-prod` data. Notably,
+`list_events()` is what surfaced a real `Warning: Evicted` event with the
+reason "The node was low on resource: ephemeral-storage" — the raw
+`reason`/`message` passthrough this method already did (no special-casing
+needed) carried that fact through untouched, exactly as designed.
 """
 
 import asyncio
@@ -69,6 +76,11 @@ class DeploymentSummary(BaseModel):
     available_replicas: Optional[int] = None
     updated_replicas: Optional[int] = None
     unavailable_replicas: Optional[int] = None
+    # Raw annotation dict — step 12's deployment-context collector reads
+    # `incidentpilot.io/commit-sha`/`branch`/`deployed-at` (stamped by
+    # deploy.sh) and k8s's own `deployment.kubernetes.io/revision` out of
+    # this rather than the adapter guessing which keys matter.
+    annotations: Dict[str, str] = {}
     image: Optional[str] = None
     created_at: Optional[datetime] = None
 
@@ -362,6 +374,7 @@ class KubernetesClient:
             unavailable_replicas=status.unavailable_replicas if status else None,
             image=image,
             created_at=dep.metadata.creation_timestamp,
+            annotations=dep.metadata.annotations or {},
         )
 
     @staticmethod

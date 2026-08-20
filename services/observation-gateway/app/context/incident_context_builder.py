@@ -9,10 +9,16 @@ records an Evidence entry (with provenance: the actual query/reference
 used) for every one of them, so a future RCA agent can cite `ev-001`
 instead of inventing a claim.
 
-Deployment status/info (spec section 9) and service topology (section 10)
-are NOT collected here — those are steps 12 and 11 respectively, with
-their own data sources (deployment annotations, K8s Service graph) that
-don't exist yet. Nothing in this module reasons about root cause; it only
+Deployment status/info (spec section 9) is collected too, as of step 12:
+for each affected service, the most recent Deployment record (commit SHA/
+branch/deployed_at, read from Kubernetes Deployment annotations via
+app/deployment/deployment_context_collector.py) becomes an Observation +
+Evidence citing how long before the incident it happened — e.g. "deployed
+4 minutes before this incident" (spec section 15's illustrative example).
+That's a plain time-delta fact, not a causal claim; nothing here decides
+whether the deployment caused anything. Service topology (section 10) is
+NOT collected here — that's step 11's own `GET /topology`, not scoped to
+an incident. Nothing in this module reasons about root cause; it only
 collects, normalizes, and cites.
 
 Resilience (spec section 13): each source's `AdapterResult.status` is
@@ -32,11 +38,13 @@ from app.collectors.loki_adapter import LokiClient
 from app.collectors.prometheus_adapter import PrometheusClient
 from app.collectors.tempo_adapter import TempoClient
 from app.config.settings import settings
+from app.deployment.deployment_context_collector import DeploymentContextCollector
+from app.normalizers.deployment_normalizer import normalize_deployment
 from app.normalizers.kubernetes_normalizer import normalize_events, normalize_pod_statuses
 from app.normalizers.loki_normalizer import normalize_log_entries
 from app.normalizers.prometheus_normalizer import normalize_metric_series
 from app.normalizers.tempo_normalizer import normalize_error_spans
-from app.storage.interfaces import EvidenceStore, IncidentStore, ObservationStore
+from app.storage.interfaces import DeploymentStore, EvidenceStore, IncidentStore, ObservationStore
 from shared.models import (
     Evidence,
     EvidenceType,
@@ -50,11 +58,19 @@ from shared.models import (
 # Query selection (spec section 12's "later concern", decided here — the
 # adapters themselves stay generic). These are the standard cAdvisor /
 # kube-state-metrics / Traefik metric names kube-prometheus-stack exports
-# by default. NOT yet confirmed against the real CloudMart cluster (no
-# live access from this sandbox — see docs/PROGRESS.md). If a probe comes
-# back empty against a service known to be running and generating load,
-# the metric/label name here is wrong for this cluster; nothing else
-# depends on the exact string, so fixing it is a one-line change.
+# by default. Live verification status per probe (2026-08-20, see
+# docs/LIVE_CLUSTER_VERIFICATION.md and docs/PROGRESS.md):
+#   - pod_restarts (kube_pod_container_status_restarts_total): CONFIRMED —
+#     real per-pod data returned for namespace="cloudmart-prod".
+#   - http_error_rate (traefik_service_requests_total): metric name
+#     CONFIRMED to exist on this Prometheus; not yet confirmed to return
+#     non-empty data for cloudmart-prod traffic specifically.
+#   - cpu_usage_seconds / memory_working_set_bytes: NOT yet run against
+#     the live cluster — still exactly the "unverified assumption" this
+#     comment originally described. If a probe comes back empty against a
+#     service known to be running and generating load, the metric/label
+#     name here is wrong for this cluster; nothing else depends on the
+#     exact string, so fixing it is a one-line change.
 _METRIC_PROBES = {
     "pod_restarts": 'kube_pod_container_status_restarts_total{{namespace="{namespace}",pod=~"{service}.*"}}',
     "cpu_usage_seconds": 'rate(container_cpu_usage_seconds_total{{namespace="{namespace}",pod=~"{service}.*"}}[5m])',
@@ -94,6 +110,22 @@ def _linked(observation: Observation, incident_id: str) -> Observation:
     )
 
 
+def _deployment_summary_text(deployment, incident: Incident) -> str:
+    """Matches spec section 15's illustrative evidence text
+    ("order-service deployed 4 minutes before incident") — a plain time
+    delta, not a claim about whether the deployment caused anything."""
+    delta_seconds = (incident.created_at - deployment.deployed_at).total_seconds()
+    minutes = int(delta_seconds // 60)
+    sha_suffix = f" (commit {deployment.commit_sha[:7]})" if deployment.commit_sha else ""
+
+    if delta_seconds < 0:
+        return f"{deployment.service}'s most recent deployment is after this incident was created{sha_suffix}"
+    if minutes < 1:
+        return f"{deployment.service} was deployed less than a minute before this incident{sha_suffix}"
+    unit = "minute" if minutes == 1 else "minutes"
+    return f"{deployment.service} deployed {minutes} {unit} before this incident{sha_suffix}"
+
+
 def _evidence_for(
     observation: Observation,
     *,
@@ -126,6 +158,7 @@ class IncidentContextBuilder:
         observation_store: ObservationStore,
         evidence_store: EvidenceStore,
         incident_store: IncidentStore,
+        deployment_store: DeploymentStore,
         window_minutes: Optional[float] = None,
     ):
         self._prometheus = prometheus
@@ -135,6 +168,9 @@ class IncidentContextBuilder:
         self._observation_store = observation_store
         self._evidence_store = evidence_store
         self._incident_store = incident_store
+        self._deployment_collector = DeploymentContextCollector(
+            kubernetes=kubernetes, deployment_store=deployment_store
+        )
         self._window_minutes = (
             window_minutes if window_minutes is not None else settings.context_window_minutes
         )
@@ -156,6 +192,7 @@ class IncidentContextBuilder:
         await self._collect_logs(incident, window_start, now, result)
         await self._collect_traces(incident, window_start, now, result)
         await self._collect_kubernetes(incident, result)
+        await self._collect_deployment_context(incident, result)
 
         latest = await self._incident_store.get(incident.incident_id)
         finished = (latest or collecting).model_copy(
@@ -463,5 +500,53 @@ class IncidentContextBuilder:
                 status=overall,
                 error="; ".join(errors) or None,
                 observation_count=count,
+            )
+        )
+
+    # --- deployment context (step 12) ---------------------------------------------
+
+    async def _collect_deployment_context(
+        self, incident: Incident, result: IncidentContextResult
+    ) -> None:
+        namespace = incident.affected_namespace
+        if namespace is None or not incident.affected_services:
+            result.source_statuses.append(
+                SourceCollectionStatus(
+                    source="deployment", status=SourceStatus.AVAILABLE, observation_count=0
+                )
+            )
+            return
+
+        overall_status = SourceStatus.AVAILABLE
+        last_error = None
+        count = 0
+
+        for service in incident.affected_services:
+            deployment, status = await self._deployment_collector.collect(namespace, service)
+            if status != SourceStatus.AVAILABLE:
+                overall_status = status
+                continue
+            if deployment is None:
+                continue
+
+            obs = normalize_deployment(
+                deployment, cluster=settings.cluster_name, incident_id=incident.incident_id
+            )
+            await self._observation_store.save(obs)
+            result.observation_ids.append(obs.observation_id)
+
+            evidence = _evidence_for(
+                obs,
+                evidence_type=EvidenceType.DEPLOYMENT,
+                summary=_deployment_summary_text(deployment, incident),
+                query=f"get_deployment(namespace={namespace}, name={service})",
+            )
+            await self._evidence_store.save(evidence)
+            result.evidence_ids.append(evidence.evidence_id)
+            count += 1
+
+        result.source_statuses.append(
+            SourceCollectionStatus(
+                source="deployment", status=overall_status, error=last_error, observation_count=count
             )
         )

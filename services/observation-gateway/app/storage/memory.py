@@ -9,9 +9,10 @@ the Postgres-backed stores later without changing any caller.
 """
 
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-from shared.models import Evidence, Incident, IncidentStatus, Observation
+from app.storage.interfaces import TopologyGraph
+from shared.models import Deployment, Evidence, Incident, IncidentStatus, Observation
 
 
 class InMemoryObservationStore:
@@ -70,3 +71,28 @@ class InMemoryEvidenceStore:
 
     async def list_by_incident(self, incident_id: str) -> List[Evidence]:
         return [e for e in self._by_id.values() if e.incident_id == incident_id]
+
+
+class InMemoryTopologyStore:
+    def __init__(self) -> None:
+        self._by_service: Dict[str, Tuple[str, List[str]]] = {}  # service -> (namespace, depends_on)
+
+    async def save_service(self, service: str, namespace: str, depends_on: List[str]) -> None:
+        self._by_service[service] = (namespace, depends_on)
+
+    async def get_all(self) -> TopologyGraph:
+        return {service: deps for service, (_, deps) in self._by_service.items()}
+
+
+class InMemoryDeploymentStore:
+    def __init__(self) -> None:
+        self._by_id: Dict[str, Deployment] = {}
+
+    async def save(self, deployment: Deployment) -> None:
+        self._by_id[deployment.deployment_id] = deployment
+
+    async def get_latest(self, service: str) -> Optional[Deployment]:
+        matches = [d for d in self._by_id.values() if d.service == service]
+        if not matches:
+            return None
+        return max(matches, key=lambda d: d.deployed_at)

@@ -147,13 +147,20 @@ def _attrs_to_dict(attributes: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]
 
 
 def _is_error_span(tags: Dict[str, Any], status_obj: Dict[str, Any]) -> bool:
-    """An OTLP span is an error if its own status.code says so (proto3 JSON
+    """A span is an error if its own status.code says so (proto3 JSON
     renders this as either the string "STATUS_CODE_ERROR" or, depending on
     the exporter's JSON marshalling options, the raw int 2 — handle both),
-    or — same fallback used for the legacy Jaeger path — if it carries an
-    http.status_code attribute >= 400."""
+    if it carries an http.status_code attribute >= 400, or if it carries a
+    boolean `error` attribute/tag — the OpenTracing/Jaeger convention some
+    exporters still set even when emitting otherwise-OTLP-shaped data.
+    Restored 2026-08-20: this fallback existed in the original Jaeger-only
+    parser and was dropped when the OTLP/Jaeger paths were unified onto
+    this shared helper — checking it costs nothing and only adds detection
+    coverage, never removes any."""
     status_code = (status_obj or {}).get("code")
     if status_code in ("STATUS_CODE_ERROR", 2):
+        return True
+    if bool(tags.get("error")):
         return True
     try:
         return int(tags.get("http.status_code")) >= 400

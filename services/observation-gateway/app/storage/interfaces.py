@@ -10,9 +10,11 @@ webhook handler.
 """
 
 from datetime import datetime
-from typing import List, Optional, Protocol
+from typing import Dict, List, Optional, Protocol
 
-from shared.models import Evidence, Incident, Observation
+from shared.models import Deployment, Evidence, Incident, Observation
+
+TopologyGraph = Dict[str, List[str]]
 
 
 class ObservationStore(Protocol):
@@ -45,3 +47,22 @@ class EvidenceStore(Protocol):
     async def save(self, evidence: Evidence) -> None: ...
 
     async def list_by_incident(self, incident_id: str) -> List[Evidence]: ...
+
+
+class TopologyStore(Protocol):
+    async def save_service(self, service: str, namespace: str, depends_on: List[str]) -> None: ...
+
+    async def get_all(self) -> TopologyGraph:
+        """service -> its list of dependencies, across every namespace
+        stored so far. Used to serve GET /topology (spec section 10)."""
+        ...
+
+
+class DeploymentStore(Protocol):
+    async def save(self, deployment: Deployment) -> None: ...
+
+    async def get_latest(self, service: str) -> Optional[Deployment]:
+        """Most recent Deployment record for a service, by `deployed_at`.
+        Used by the Context Builder (step 12) to answer "was this service
+        deployed recently" for an incident."""
+        ...
