@@ -6,6 +6,7 @@ from .enums import (
     Severity,
     SignalType,
 )
+from .deployment import Deployment
 from .evidence import Evidence, RawReference
 from .incident import Incident
 from .observation import Correlation, Observation
@@ -22,4 +23,5 @@ __all__ = [
     "Incident",
     "Evidence",
     "RawReference",
+    "Deployment",
 ]

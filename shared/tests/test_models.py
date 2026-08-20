@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from shared.models import (
     Correlation,
+    Deployment,
     Evidence,
     EvidenceType,
     Incident,
@@ -211,3 +212,58 @@ def test_evidence_json_roundtrip():
     dumped = ev.model_dump_json()
     restored = Evidence.model_validate_json(dumped)
     assert restored == ev
+
+
+# ---------------------------------------------------------------------------
+# Deployment
+# ---------------------------------------------------------------------------
+
+
+def test_deployment_valid_construction_with_full_metadata():
+    dep = Deployment(
+        deployment_id="dep-order-service-abc1234",
+        service="order-service",
+        namespace="cloudmart-prod",
+        commit_sha="abc1234",
+        branch="main",
+        image_tag="localhost:5000/cloudmart/order-service:v1",
+        rollout_revision="5",
+        deployed_at=NOW,
+        success=True,
+    )
+    assert dep.commit_sha == "abc1234"
+    assert dep.success is True
+
+
+def test_deployment_allows_unknown_commit_metadata():
+    # e.g. a Deployment that predates deploy.sh's annotation stamping —
+    # must not fail to construct just because the annotations aren't there
+    dep = Deployment(
+        deployment_id="dep-order-service-unknown",
+        service="order-service",
+        namespace="cloudmart-prod",
+        deployed_at=NOW,
+    )
+    assert dep.commit_sha is None
+    assert dep.branch is None
+    assert dep.success is None
+
+
+def test_deployment_rejects_naive_timestamp():
+    with pytest.raises(ValidationError):
+        Deployment(
+            deployment_id="dep-001",
+            service="order-service",
+            namespace="cloudmart-prod",
+            deployed_at=datetime(2026, 8, 20, 9, 0),
+        )
+
+
+def test_deployment_rejects_blank_service():
+    with pytest.raises(ValidationError):
+        Deployment(
+            deployment_id="dep-001",
+            service="  ",
+            namespace="cloudmart-prod",
+            deployed_at=NOW,
+        )
