@@ -19,12 +19,15 @@ from datetime import datetime, timedelta, timezone
 import asyncpg
 import pytest
 
+from app.storage.postgres.deployment_store import PostgresDeploymentStore
 from app.storage.postgres.evidence_store import PostgresEvidenceStore
 from app.storage.postgres.incident_store import PostgresIncidentStore
 from app.storage.postgres.observation_store import PostgresObservationStore
 from app.storage.postgres.pool import create_pool, init_schema
+from app.storage.postgres.topology_store import PostgresTopologyStore
 from shared.models import (
     Correlation,
+    Deployment,
     Evidence,
     EvidenceType,
     Incident,
@@ -306,6 +309,101 @@ async def test_evidence_save_is_upsert(pool):
     fetched = await evidence_store.list_by_incident(incident.incident_id)
     assert len(fetched) == 1
     assert fetched[0].summary == "updated summary"
+
+
+# --- step 11: PostgresTopologyStore ------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_topology_save_and_get_all(pool):
+    store = PostgresTopologyStore(pool)
+    await store.save_service("frontend", "cloudmart-prod", ["product-service", "order-service"])
+    await store.save_service("product-service", "cloudmart-prod", [])
+
+    graph = await store.get_all()
+    assert graph["frontend"] == ["product-service", "order-service"]
+    assert graph["product-service"] == []
+
+
+@pytest.mark.anyio
+async def test_topology_save_service_is_upsert(pool):
+    store = PostgresTopologyStore(pool)
+    await store.save_service("frontend", "cloudmart-prod", ["product-service"])
+    await store.save_service("frontend", "cloudmart-prod", ["product-service", "order-service"])
+
+    graph = await store.get_all()
+    assert graph["frontend"] == ["product-service", "order-service"]
+    assert len(graph) == 1
+
+
+# --- step 12: PostgresDeploymentStore ---------------------------------------
+
+
+def make_deployment(**overrides) -> Deployment:
+    defaults = dict(
+        deployment_id="dep-order-service-abc1234",
+        service="order-service",
+        namespace="cloudmart-prod",
+        commit_sha="abc1234",
+        branch="main",
+        image_tag="localhost:5000/cloudmart/order-service:v1",
+        rollout_revision="7",
+        deployed_at=datetime.now(timezone.utc),
+        success=True,
+    )
+    defaults.update(overrides)
+    return Deployment(**defaults)
+
+
+@pytest.mark.anyio
+async def test_deployment_round_trip_including_branch_column(pool):
+    store = PostgresDeploymentStore(pool)
+    deployment = make_deployment()
+    await store.save(deployment)
+
+    fetched = await store.get_latest("order-service")
+    assert fetched is not None
+    assert fetched.commit_sha == "abc1234"
+    assert fetched.branch == "main"
+    assert fetched.rollout_revision == "7"
+    assert fetched.success is True
+
+
+@pytest.mark.anyio
+async def test_deployment_get_latest_returns_most_recent(pool):
+    store = PostgresDeploymentStore(pool)
+    older = make_deployment(
+        deployment_id="dep-order-service-older",
+        commit_sha="older111",
+        deployed_at=datetime.now(timezone.utc) - timedelta(hours=1),
+    )
+    newer = make_deployment(
+        deployment_id="dep-order-service-newer",
+        commit_sha="newer222",
+        deployed_at=datetime.now(timezone.utc),
+    )
+    await store.save(older)
+    await store.save(newer)
+
+    latest = await store.get_latest("order-service")
+    assert latest.commit_sha == "newer222"
+
+
+@pytest.mark.anyio
+async def test_deployment_get_latest_missing_service_returns_none(pool):
+    store = PostgresDeploymentStore(pool)
+    assert await store.get_latest("nonexistent-service") is None
+
+
+@pytest.mark.anyio
+async def test_deployment_save_is_upsert(pool):
+    store = PostgresDeploymentStore(pool)
+    deployment = make_deployment()
+    await store.save(deployment)
+    await store.save(deployment.model_copy(update={"success": False}))
+
+    fetched = await store.get_latest("order-service")
+    assert fetched.success is False
 
 
 @pytest.fixture()

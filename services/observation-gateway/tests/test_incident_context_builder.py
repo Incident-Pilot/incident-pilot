@@ -10,7 +10,12 @@ from app.collectors.loki_adapter import LokiClient
 from app.collectors.prometheus_adapter import PrometheusClient
 from app.collectors.tempo_adapter import TempoClient
 from app.context.incident_context_builder import IncidentContextBuilder
-from app.storage.memory import InMemoryEvidenceStore, InMemoryIncidentStore, InMemoryObservationStore
+from app.storage.memory import (
+    InMemoryDeploymentStore,
+    InMemoryEvidenceStore,
+    InMemoryIncidentStore,
+    InMemoryObservationStore,
+)
 from shared.models import Incident, IncidentPhase, Severity
 
 
@@ -84,6 +89,7 @@ def make_builder(
     tempo_trace_result=None,
     k8s_events_result=None,
     k8s_pods_result=None,
+    k8s_deployment_result=None,
     prometheus=True,
     loki=True,
     tempo=True,
@@ -92,6 +98,7 @@ def make_builder(
     observation_store = InMemoryObservationStore()
     evidence_store = InMemoryEvidenceStore()
     incident_store = InMemoryIncidentStore()
+    deployment_store = InMemoryDeploymentStore()
 
     prom_client = None
     if prometheus:
@@ -131,6 +138,13 @@ def make_builder(
         k8s_client.list_pods = AsyncMock(
             return_value=k8s_pods_result or AdapterResult(status=SourceStatus.AVAILABLE, data=[])
         )
+        # Default: "no Deployment" (UNAVAILABLE with a 404-ish error) rather
+        # than AVAILABLE-with-None, so tests that don't care about
+        # deployment context get a clean "nothing collected" outcome.
+        k8s_client.get_deployment = AsyncMock(
+            return_value=k8s_deployment_result
+            or AdapterResult(status=SourceStatus.UNAVAILABLE, error="deployment not found")
+        )
 
     builder = IncidentContextBuilder(
         prometheus=prom_client,
@@ -140,12 +154,13 @@ def make_builder(
         observation_store=observation_store,
         evidence_store=evidence_store,
         incident_store=incident_store,
+        deployment_store=deployment_store,
     )
-    return builder, observation_store, evidence_store, incident_store
+    return builder, observation_store, evidence_store, incident_store, deployment_store
 
 
 def test_build_collects_all_sources_and_marks_ready():
-    builder, obs_store, evid_store, incident_store = make_builder()
+    builder, obs_store, evid_store, incident_store, deployment_store = make_builder()
     incident = make_incident()
     run(incident_store.save(incident))
 
@@ -164,7 +179,7 @@ def test_build_collects_all_sources_and_marks_ready():
 
 
 def test_build_every_evidence_cites_a_real_observation():
-    builder, obs_store, evid_store, incident_store = make_builder()
+    builder, obs_store, evid_store, incident_store, deployment_store = make_builder()
     incident = make_incident()
     run(incident_store.save(incident))
     run(builder.build(incident))
@@ -178,7 +193,7 @@ def test_build_every_evidence_cites_a_real_observation():
 
 
 def test_prometheus_unavailable_does_not_block_other_sources():
-    builder, obs_store, evid_store, incident_store = make_builder(
+    builder, obs_store, evid_store, incident_store, deployment_store = make_builder(
         prometheus_result=AdapterResult(status=SourceStatus.UNAVAILABLE, error="connection refused")
     )
     incident = make_incident()
@@ -195,7 +210,7 @@ def test_prometheus_unavailable_does_not_block_other_sources():
 
 
 def test_tempo_timeout_reported_without_raising():
-    builder, obs_store, evid_store, incident_store = make_builder(
+    builder, obs_store, evid_store, incident_store, deployment_store = make_builder(
         tempo_search_result=AdapterResult(status=SourceStatus.TIMEOUT, error="Tempo request timed out")
     )
     incident = make_incident()
@@ -207,7 +222,7 @@ def test_tempo_timeout_reported_without_raising():
 
 
 def test_missing_kubernetes_client_reports_unavailable_not_crash():
-    builder, obs_store, evid_store, incident_store = make_builder(kubernetes=False)
+    builder, obs_store, evid_store, incident_store, deployment_store = make_builder(kubernetes=False)
     incident = make_incident()
     run(incident_store.save(incident))
     result = run(builder.build(incident))
@@ -220,7 +235,7 @@ def test_missing_kubernetes_client_reports_unavailable_not_crash():
 
 
 def test_all_sources_unavailable_still_reaches_ready_for_investigation():
-    builder, obs_store, evid_store, incident_store = make_builder(
+    builder, obs_store, evid_store, incident_store, deployment_store = make_builder(
         prometheus=False, loki=False, tempo=False, kubernetes=False
     )
     incident = make_incident()
@@ -235,7 +250,7 @@ def test_all_sources_unavailable_still_reaches_ready_for_investigation():
 
 
 def test_initial_alerts_produce_evidence_for_already_linked_observations():
-    builder, obs_store, evid_store, incident_store = make_builder()
+    builder, obs_store, evid_store, incident_store, deployment_store = make_builder()
     incident = make_incident()
     run(incident_store.save(incident))
 
@@ -260,7 +275,7 @@ def test_initial_alerts_produce_evidence_for_already_linked_observations():
 
 
 def test_running_build_twice_does_not_duplicate_alert_evidence():
-    builder, obs_store, evid_store, incident_store = make_builder()
+    builder, obs_store, evid_store, incident_store, deployment_store = make_builder()
     incident = make_incident()
     run(incident_store.save(incident))
 
@@ -285,7 +300,7 @@ def test_running_build_twice_does_not_duplicate_alert_evidence():
 
 
 def test_no_namespace_or_services_skips_heavy_queries_without_crashing():
-    builder, obs_store, evid_store, incident_store = make_builder()
+    builder, obs_store, evid_store, incident_store, deployment_store = make_builder()
     incident = make_incident(affected_namespace=None, affected_services=[])
     run(incident_store.save(incident))
 
@@ -299,3 +314,88 @@ def test_no_namespace_or_services_skips_heavy_queries_without_crashing():
     # nothing to query without namespace/service, so nothing collected
     prom_count = next(s.observation_count for s in result.source_statuses if s.source == "prometheus")
     assert prom_count == 0
+
+
+# --- step 12: deployment context --------------------------------------------
+
+
+def _deployment_result(**overrides):
+    from app.collectors.kubernetes_adapter import DeploymentSummary
+
+    defaults = dict(
+        name="order-service",
+        namespace="cloudmart-prod",
+        replicas=2,
+        ready_replicas=2,
+        created_at=datetime(2026, 8, 20, 8, 0, tzinfo=timezone.utc),
+        annotations={
+            "incidentpilot.io/commit-sha": "abc1234def",
+            "incidentpilot.io/branch": "main",
+            "incidentpilot.io/deployed-at": "2026-08-20T09:00:00Z",
+            "deployment.kubernetes.io/revision": "7",
+        },
+    )
+    defaults.update(overrides)
+    return AdapterResult(status=SourceStatus.AVAILABLE, data=DeploymentSummary(**defaults))
+
+
+def test_deployment_context_produces_time_delta_evidence():
+    builder, obs_store, evid_store, incident_store, deployment_store = make_builder(
+        k8s_deployment_result=_deployment_result()
+    )
+    incident = make_incident(created_at=datetime(2026, 8, 20, 9, 4, tzinfo=timezone.utc))
+    run(incident_store.save(incident))
+
+    result = run(builder.build(incident))
+
+    statuses = {s.source: s.status for s in result.source_statuses}
+    assert statuses["deployment"] == SourceStatus.AVAILABLE
+
+    evidence_list = run(evid_store.list_by_incident(incident.incident_id))
+    deployment_evidence = [e for e in evidence_list if e.type.value == "deployment"]
+    assert len(deployment_evidence) == 1
+    assert "4 minutes before this incident" in deployment_evidence[0].summary
+    assert "abc1234" in deployment_evidence[0].summary
+
+
+def test_deployment_context_evidence_cites_a_real_observation():
+    builder, obs_store, evid_store, incident_store, deployment_store = make_builder(
+        k8s_deployment_result=_deployment_result()
+    )
+    incident = make_incident()
+    run(incident_store.save(incident))
+    run(builder.build(incident))
+
+    evidence_list = run(evid_store.list_by_incident(incident.incident_id))
+    deployment_evidence = [e for e in evidence_list if e.type.value == "deployment"][0]
+    observation_ids = {o.observation_id for o in run(obs_store.list_all())}
+    assert deployment_evidence.observation_id in observation_ids
+
+
+def test_deployment_context_persists_to_deployment_store():
+    builder, obs_store, evid_store, incident_store, deployment_store = make_builder(
+        k8s_deployment_result=_deployment_result()
+    )
+    incident = make_incident()
+    run(incident_store.save(incident))
+    run(builder.build(incident))
+
+    latest = run(deployment_store.get_latest("order-service"))
+    assert latest is not None
+    assert latest.commit_sha == "abc1234def"
+
+
+def test_no_deployment_found_produces_no_evidence_but_still_available():
+    builder, obs_store, evid_store, incident_store, deployment_store = make_builder()
+    incident = make_incident()
+    run(incident_store.save(incident))
+
+    result = run(builder.build(incident))
+
+    statuses = {s.source: s.status for s in result.source_statuses}
+    assert statuses["deployment"] == SourceStatus.UNAVAILABLE
+    evidence_list = run(evid_store.list_by_incident(incident.incident_id))
+    assert not [e for e in evidence_list if e.type.value == "deployment"]
+
+    final = run(incident_store.get(incident.incident_id))
+    assert final.current_phase == IncidentPhase.READY_FOR_INVESTIGATION

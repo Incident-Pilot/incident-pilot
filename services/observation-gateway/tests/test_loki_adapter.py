@@ -171,6 +171,22 @@ def test_parse_entries_falls_back_through_candidate_label_keys():
     assert entries[0].pod is None
 
 
+def test_parse_entries_service_falls_back_to_service_name_label():
+    # `service_name` confirmed present on the real cluster's Promtail
+    # output (live verification, 2026-08-20) but not previously in the
+    # candidate list — `app` still wins when both are present.
+    data = {
+        "result": [
+            {
+                "stream": {"service_name": "notification-service"},
+                "values": [["1755075600000000000", "queue consumer started"]],
+            }
+        ]
+    }
+    entries = LokiClient.parse_entries(data)
+    assert entries[0].service == "notification-service"
+
+
 def test_parse_entries_handles_multiple_streams_and_multiple_lines():
     data = {
         "result": [

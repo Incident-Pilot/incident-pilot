@@ -5,12 +5,13 @@ from app.main import create_app
 
 
 @pytest.fixture()
-def client():
+def client(bypass_auth):
     # Fresh app (and therefore fresh in-memory stores) per test — the
     # module-level `app` singleton in app.main would otherwise leak state
     # between tests since InMemoryIncidentStore/InMemoryObservationStore
     # are plain dicts with no reset hook.
     app = create_app()
+    bypass_auth(app)
     # A firing alert now also kicks off the step-10 Context Builder as a
     # background task, which TestClient runs synchronously before the
     # request returns. create_app() wires the real Prometheus/Loki/Tempo/

@@ -180,6 +180,61 @@ def test_list_deployments_summarizes_replica_counts_and_image():
     assert dep.image == "localhost:5000/order-service:v42"
 
 
+def test_list_deployments_preserves_annotations():
+    apps_v1 = MagicMock()
+    apps_v1.list_namespaced_deployment.return_value = client.V1DeploymentList(
+        items=[
+            client.V1Deployment(
+                metadata=client.V1ObjectMeta(
+                    name="order-service",
+                    namespace="cloudmart-prod",
+                    annotations={
+                        "incidentpilot.io/commit-sha": "abc1234",
+                        "incidentpilot.io/branch": "main",
+                        "incidentpilot.io/deployed-at": "2026-08-20T09:00:00Z",
+                        "deployment.kubernetes.io/revision": "5",
+                    },
+                ),
+                spec=client.V1DeploymentSpec(
+                    selector=client.V1LabelSelector(match_labels={"app": "order-service"}),
+                    template=client.V1PodTemplateSpec(
+                        spec=client.V1PodSpec(containers=[])
+                    ),
+                ),
+                status=client.V1DeploymentStatus(),
+            )
+        ]
+    )
+
+    kube = make_client(apps_v1=apps_v1)
+    result = run(kube.list_deployments("cloudmart-prod"))
+
+    dep = result.data[0]
+    assert dep.annotations["incidentpilot.io/commit-sha"] == "abc1234"
+    assert dep.annotations["deployment.kubernetes.io/revision"] == "5"
+
+
+def test_list_deployments_missing_annotations_defaults_to_empty_dict():
+    apps_v1 = MagicMock()
+    apps_v1.list_namespaced_deployment.return_value = client.V1DeploymentList(
+        items=[
+            client.V1Deployment(
+                metadata=client.V1ObjectMeta(name="order-service", namespace="cloudmart-prod"),
+                spec=client.V1DeploymentSpec(
+                    selector=client.V1LabelSelector(match_labels={"app": "order-service"}),
+                    template=client.V1PodTemplateSpec(spec=client.V1PodSpec(containers=[])),
+                ),
+                status=client.V1DeploymentStatus(),
+            )
+        ]
+    )
+
+    kube = make_client(apps_v1=apps_v1)
+    result = run(kube.list_deployments("cloudmart-prod"))
+
+    assert result.data[0].annotations == {}
+
+
 # --- events (spec section 16) ---------------------------------------------
 
 
