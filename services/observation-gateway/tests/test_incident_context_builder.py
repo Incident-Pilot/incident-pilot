@@ -15,6 +15,7 @@ from app.storage.memory import (
     InMemoryEvidenceStore,
     InMemoryIncidentStore,
     InMemoryObservationStore,
+    InMemorySourceStatusStore,
 )
 from shared.models import Incident, IncidentPhase, Severity
 
@@ -299,6 +300,41 @@ def test_running_build_twice_does_not_duplicate_alert_evidence():
     assert len(alert_evidence) == 1
 
 
+def test_source_statuses_are_persisted_to_the_status_store():
+    # Regression test: build()'s IncidentContextResult.source_statuses used
+    # to be discarded entirely by the background task that calls it (no
+    # logs, API, or storage exposed per-source AVAILABLE/UNAVAILABLE/
+    # TIMEOUT/PARTIAL outcomes). build() now persists them via a
+    # SourceStatusStore so GET /incidents/{id}/source-status can serve them.
+    builder, obs_store, evid_store, incident_store, deployment_store = make_builder(
+        prometheus_result=AdapterResult(status=SourceStatus.UNAVAILABLE, error="connection refused")
+    )
+    incident = make_incident()
+    run(incident_store.save(incident))
+
+    result = run(builder.build(incident))
+
+    persisted = run(builder._source_status_store.list_by_incident(incident.incident_id))
+    persisted_by_source = {s.source: s for s in persisted}
+    assert persisted_by_source["prometheus"].status == SourceStatus.UNAVAILABLE
+    assert persisted_by_source["prometheus"].error == "connection refused"
+    assert persisted_by_source["loki"].status == SourceStatus.AVAILABLE
+    assert {s.source for s in persisted} == {s.source for s in result.source_statuses}
+
+
+def test_rerunning_build_replaces_rather_than_accumulates_source_statuses():
+    builder, obs_store, evid_store, incident_store, deployment_store = make_builder()
+    incident = make_incident()
+    run(incident_store.save(incident))
+
+    run(builder.build(incident))
+    run(builder.build(incident))
+
+    persisted = run(builder._source_status_store.list_by_incident(incident.incident_id))
+    sources = [s.source for s in persisted]
+    assert len(sources) == len(set(sources))
+
+
 def test_no_namespace_or_services_skips_heavy_queries_without_crashing():
     builder, obs_store, evid_store, incident_store, deployment_store = make_builder()
     incident = make_incident(affected_namespace=None, affected_services=[])
@@ -383,6 +419,21 @@ def test_deployment_context_persists_to_deployment_store():
     latest = run(deployment_store.get_latest("order-service"))
     assert latest is not None
     assert latest.commit_sha == "abc1234def"
+
+
+def test_running_build_twice_does_not_duplicate_deployment_evidence():
+    builder, obs_store, evid_store, incident_store, deployment_store = make_builder(
+        k8s_deployment_result=_deployment_result()
+    )
+    incident = make_incident()
+    run(incident_store.save(incident))
+
+    run(builder.build(incident))
+    run(builder.build(incident))
+
+    evidence_list = run(evid_store.list_by_incident(incident.incident_id))
+    deployment_evidence = [e for e in evidence_list if e.type.value == "deployment"]
+    assert len(deployment_evidence) == 1
 
 
 def test_no_deployment_found_produces_no_evidence_but_still_available():

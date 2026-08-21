@@ -227,3 +227,54 @@ def test_get_incident_timeline_sorted_chronologically(client):
 def test_get_incident_timeline_404_for_missing_incident(client):
     resp = client.get("/incidents/INC-DOES-NOT-EXIST/timeline")
     assert resp.status_code == 404
+
+
+def test_get_incident_source_status_returns_persisted_statuses(client):
+    from app.collectors.base import SourceCollectionStatus, SourceStatus
+
+    incident = make_incident()
+    seed_incident(client, incident)
+    run(
+        client.app.state.source_status_store.save_many(
+            incident.incident_id,
+            [
+                SourceCollectionStatus(
+                    source="prometheus", status=SourceStatus.AVAILABLE, observation_count=12
+                ),
+                SourceCollectionStatus(
+                    source="kubernetes",
+                    status=SourceStatus.UNAVAILABLE,
+                    error="RBAC forbidden",
+                    observation_count=0,
+                ),
+            ],
+        )
+    )
+
+    resp = client.get(f"/incidents/{incident.incident_id}/source-status")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["incident_id"] == incident.incident_id
+    by_source = {s["source"]: s for s in body["source_status"]}
+    assert by_source["prometheus"] == {
+        "source": "prometheus",
+        "status": "available",
+        "error": None,
+        "observation_count": 12,
+    }
+    assert by_source["kubernetes"]["status"] == "unavailable"
+    assert by_source["kubernetes"]["error"] == "RBAC forbidden"
+
+
+def test_get_incident_source_status_404_for_missing_incident(client):
+    resp = client.get("/incidents/INC-DOES-NOT-EXIST/source-status")
+    assert resp.status_code == 404
+
+
+def test_get_incident_source_status_empty_before_context_collection(client):
+    incident = make_incident()
+    seed_incident(client, incident)
+
+    resp = client.get(f"/incidents/{incident.incident_id}/source-status")
+    assert resp.status_code == 200
+    assert resp.json()["source_status"] == []

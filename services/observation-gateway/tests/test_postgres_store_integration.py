@@ -19,11 +19,13 @@ from datetime import datetime, timedelta, timezone
 import asyncpg
 import pytest
 
+from app.collectors.base import SourceCollectionStatus, SourceStatus
 from app.storage.postgres.deployment_store import PostgresDeploymentStore
 from app.storage.postgres.evidence_store import PostgresEvidenceStore
 from app.storage.postgres.incident_store import PostgresIncidentStore
 from app.storage.postgres.observation_store import PostgresObservationStore
 from app.storage.postgres.pool import create_pool, init_schema
+from app.storage.postgres.source_status_store import PostgresSourceStatusStore
 from app.storage.postgres.topology_store import PostgresTopologyStore
 from shared.models import (
     Correlation,
@@ -51,7 +53,8 @@ async def pool():
     await init_schema(p)
     async with p.acquire() as conn:
         await conn.execute(
-            "TRUNCATE evidence, deployments, service_topology, observations, incidents"
+            "TRUNCATE evidence, deployments, service_topology, incident_source_status, "
+            "observations, incidents"
         )
     yield p
     await p.close()
@@ -404,6 +407,59 @@ async def test_deployment_save_is_upsert(pool):
 
     fetched = await store.get_latest("order-service")
     assert fetched.success is False
+
+
+# --- source_status: incident_source_status (spec section 13/37) -----------
+
+
+@pytest.mark.anyio
+async def test_source_status_round_trip(pool):
+    incident_store = PostgresIncidentStore(pool)
+    status_store = PostgresSourceStatusStore(pool)
+    incident = make_incident()
+    await incident_store.save(incident)
+
+    await status_store.save_many(
+        incident.incident_id,
+        [
+            SourceCollectionStatus(source="prometheus", status=SourceStatus.AVAILABLE, observation_count=5),
+            SourceCollectionStatus(
+                source="kubernetes",
+                status=SourceStatus.UNAVAILABLE,
+                error="RBAC forbidden",
+                observation_count=0,
+            ),
+        ],
+    )
+
+    fetched = await status_store.list_by_incident(incident.incident_id)
+    by_source = {s.source: s for s in fetched}
+    assert by_source["prometheus"].status == SourceStatus.AVAILABLE
+    assert by_source["prometheus"].observation_count == 5
+    assert by_source["kubernetes"].status == SourceStatus.UNAVAILABLE
+    assert by_source["kubernetes"].error == "RBAC forbidden"
+
+
+@pytest.mark.anyio
+async def test_source_status_save_many_replaces_previous_run(pool):
+    incident_store = PostgresIncidentStore(pool)
+    status_store = PostgresSourceStatusStore(pool)
+    incident = make_incident()
+    await incident_store.save(incident)
+
+    await status_store.save_many(
+        incident.incident_id,
+        [SourceCollectionStatus(source="tempo", status=SourceStatus.TIMEOUT, error="slow")],
+    )
+    await status_store.save_many(
+        incident.incident_id,
+        [SourceCollectionStatus(source="tempo", status=SourceStatus.AVAILABLE, observation_count=3)],
+    )
+
+    fetched = await status_store.list_by_incident(incident.incident_id)
+    assert len(fetched) == 1
+    assert fetched[0].status == SourceStatus.AVAILABLE
+    assert fetched[0].observation_count == 3
 
 
 @pytest.fixture()
