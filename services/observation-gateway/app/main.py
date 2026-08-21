@@ -38,6 +38,7 @@ from app.storage.memory import (
     InMemoryEvidenceStore,
     InMemoryIncidentStore,
     InMemoryObservationStore,
+    InMemorySourceStatusStore,
     InMemoryTopologyStore,
 )
 from app.storage.postgres.deployment_store import PostgresDeploymentStore
@@ -45,6 +46,7 @@ from app.storage.postgres.evidence_store import PostgresEvidenceStore
 from app.storage.postgres.incident_store import PostgresIncidentStore
 from app.storage.postgres.observation_store import PostgresObservationStore
 from app.storage.postgres.pool import create_pool, init_schema
+from app.storage.postgres.source_status_store import PostgresSourceStatusStore
 from app.storage.postgres.topology_store import PostgresTopologyStore
 
 
@@ -59,6 +61,7 @@ async def _lifespan(app: FastAPI):
         app.state.evidence_store = PostgresEvidenceStore(pool)
         app.state.topology_store = PostgresTopologyStore(pool)
         app.state.deployment_store = PostgresDeploymentStore(pool)
+        app.state.source_status_store = PostgresSourceStatusStore(pool)
     yield
     pool = getattr(app.state, "pg_pool", None)
     if pool is not None:
@@ -75,6 +78,7 @@ def create_app() -> FastAPI:
     app.state.evidence_store = InMemoryEvidenceStore()
     app.state.topology_store = InMemoryTopologyStore()
     app.state.deployment_store = InMemoryDeploymentStore()
+    app.state.source_status_store = InMemorySourceStatusStore()
 
     app.state.prometheus_client = PrometheusClient(
         settings.prometheus_base_url, timeout_seconds=settings.http_timeout_seconds
