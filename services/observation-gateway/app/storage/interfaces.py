@@ -12,6 +12,7 @@ webhook handler.
 from datetime import datetime
 from typing import Dict, List, Optional, Protocol
 
+from app.collectors.base import SourceCollectionStatus
 from shared.models import Deployment, Evidence, Incident, Observation
 
 TopologyGraph = Dict[str, List[str]]
@@ -66,3 +67,20 @@ class DeploymentStore(Protocol):
         Used by the Context Builder (step 12) to answer "was this service
         deployed recently" for an incident."""
         ...
+
+
+class SourceStatusStore(Protocol):
+    """Durable record of each context source's per-incident outcome (spec
+    section 13/37 — "partial telemetry failure handled" has to be visible
+    somewhere other than logs). `IncidentContextBuilder.build()` used to
+    return an `IncidentContextResult` whose `source_statuses` was simply
+    discarded by the background task that calls it; this store is what
+    `GET /incidents/{id}/source-status` reads instead."""
+
+    async def save_many(self, incident_id: str, statuses: List[SourceCollectionStatus]) -> None:
+        """Replaces any previously stored statuses for this incident with
+        the latest run's — a re-run's status should reflect current
+        reality, not accumulate history."""
+        ...
+
+    async def list_by_incident(self, incident_id: str) -> List[SourceCollectionStatus]: ...

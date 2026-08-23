@@ -31,3 +31,18 @@ class AdapterResult(BaseModel, Generic[T]):
     @property
     def ok(self) -> bool:
         return self.status == SourceStatus.AVAILABLE
+
+
+class SourceCollectionStatus(BaseModel):
+    """Per-source outcome of one Incident Context Builder run (spec section
+    13) — AVAILABLE/UNAVAILABLE/TIMEOUT/PARTIAL plus how many Observations
+    it produced. Lives here rather than in incident_context_builder.py so
+    `app/storage/interfaces.py` can depend on it without importing the
+    builder module."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str
+    status: SourceStatus
+    error: Optional[str] = None
+    observation_count: int = 0

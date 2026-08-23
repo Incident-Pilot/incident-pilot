@@ -83,3 +83,20 @@ CREATE TABLE IF NOT EXISTS service_topology (
     depends_on   JSONB NOT NULL DEFAULT '[]',
     updated_at   TIMESTAMPTZ NOT NULL
 );
+
+-- Added to fix a completeness gap (spec section 13/37): the Incident
+-- Context Builder always computed per-source AVAILABLE/UNAVAILABLE/
+-- TIMEOUT/PARTIAL status but nothing durable ever stored it, so a Loki/
+-- Tempo/Kubernetes failure during collection was invisible outside of
+-- reading source code. One row per (incident, source); a re-run of
+-- context collection for the same incident replaces its rows rather than
+-- appending, so this always reflects the latest collection attempt.
+CREATE TABLE IF NOT EXISTS incident_source_status (
+    incident_id        TEXT NOT NULL REFERENCES incidents(incident_id) ON DELETE CASCADE,
+    source             TEXT NOT NULL,
+    status             TEXT NOT NULL,
+    error              TEXT,
+    observation_count  INTEGER NOT NULL DEFAULT 0,
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (incident_id, source)
+);

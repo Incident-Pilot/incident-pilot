@@ -11,6 +11,7 @@ the Postgres-backed stores later without changing any caller.
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
+from app.collectors.base import SourceCollectionStatus
 from app.storage.interfaces import TopologyGraph
 from shared.models import Deployment, Evidence, Incident, IncidentStatus, Observation
 
@@ -96,3 +97,14 @@ class InMemoryDeploymentStore:
         if not matches:
             return None
         return max(matches, key=lambda d: d.deployed_at)
+
+
+class InMemorySourceStatusStore:
+    def __init__(self) -> None:
+        self._by_incident: Dict[str, List[SourceCollectionStatus]] = {}
+
+    async def save_many(self, incident_id: str, statuses: List[SourceCollectionStatus]) -> None:
+        self._by_incident[incident_id] = list(statuses)
+
+    async def list_by_incident(self, incident_id: str) -> List[SourceCollectionStatus]:
+        return list(self._by_incident.get(incident_id, []))

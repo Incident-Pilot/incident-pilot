@@ -24,7 +24,11 @@ collects, normalizes, and cites.
 Resilience (spec section 13): each source's `AdapterResult.status` is
 recorded independently. One backend being unavailable/timing out never
 stops the others from being collected — this is exactly the "Tempo is
-mid-restart-loop" scenario the spec calls out.
+mid-restart-loop" scenario the spec calls out. `build()` persists the
+resulting `source_statuses` via `SourceStatusStore` before returning (see
+`GET /incidents/{id}/source-status` in app/api/incidents.py) — the
+background task in app/api/webhooks.py discards `build()`'s return value,
+so this is the only durable record of which sources actually succeeded.
 """
 
 from dataclasses import dataclass, field
@@ -32,7 +36,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from uuid import uuid4
 
-from app.collectors.base import SourceStatus
+from app.collectors.base import SourceCollectionStatus, SourceStatus
 from app.collectors.kubernetes_adapter import KubernetesClient
 from app.collectors.loki_adapter import LokiClient
 from app.collectors.prometheus_adapter import PrometheusClient
@@ -44,7 +48,14 @@ from app.normalizers.kubernetes_normalizer import normalize_events, normalize_po
 from app.normalizers.loki_normalizer import normalize_log_entries
 from app.normalizers.prometheus_normalizer import normalize_metric_series
 from app.normalizers.tempo_normalizer import normalize_error_spans
-from app.storage.interfaces import DeploymentStore, EvidenceStore, IncidentStore, ObservationStore
+from app.storage.interfaces import (
+    DeploymentStore,
+    EvidenceStore,
+    IncidentStore,
+    ObservationStore,
+    SourceStatusStore,
+)
+from app.storage.memory import InMemorySourceStatusStore
 from shared.models import (
     Evidence,
     EvidenceType,
@@ -80,14 +91,6 @@ _METRIC_PROBES = {
 _LOG_ERROR_QUERY_TEMPLATE = '{{namespace="{namespace}"}} |~ "(?i)error|exception|timeout|fail"'
 _MAX_LOG_ENTRIES_PER_SERVICE = 50
 _MAX_TRACES_FETCHED_PER_SERVICE = 5
-
-
-@dataclass
-class SourceCollectionStatus:
-    source: str
-    status: SourceStatus
-    error: Optional[str] = None
-    observation_count: int = 0
 
 
 @dataclass
@@ -159,6 +162,7 @@ class IncidentContextBuilder:
         evidence_store: EvidenceStore,
         incident_store: IncidentStore,
         deployment_store: DeploymentStore,
+        source_status_store: Optional[SourceStatusStore] = None,
         window_minutes: Optional[float] = None,
     ):
         self._prometheus = prometheus
@@ -168,6 +172,7 @@ class IncidentContextBuilder:
         self._observation_store = observation_store
         self._evidence_store = evidence_store
         self._incident_store = incident_store
+        self._source_status_store = source_status_store or InMemorySourceStatusStore()
         self._deployment_collector = DeploymentContextCollector(
             kubernetes=kubernetes, deployment_store=deployment_store
         )
@@ -193,6 +198,8 @@ class IncidentContextBuilder:
         await self._collect_traces(incident, window_start, now, result)
         await self._collect_kubernetes(incident, result)
         await self._collect_deployment_context(incident, result)
+
+        await self._source_status_store.save_many(incident.incident_id, result.source_statuses)
 
         latest = await self._incident_store.get(incident.incident_id)
         finished = (latest or collecting).model_copy(
@@ -517,6 +524,19 @@ class IncidentContextBuilder:
             )
             return
 
+        # `build()` can run more than once for the same incident (a later
+        # webhook delivery correlating into an already-OPEN incident
+        # re-triggers context collection — see _collect_initial_alerts'
+        # `already_cited` guard for the same reason). Deployment state
+        # rarely changes between two closely-spaced runs, so without this
+        # guard re-running produces a second, near-identical Evidence entry
+        # per service instead of a no-op.
+        already_collected = {
+            obs.metadata.get("deployment_id")
+            for obs in await self._observation_store.list_by_incident(incident.incident_id)
+            if obs.source == ObservationSource.GIT and obs.metadata.get("deployment_id")
+        }
+
         overall_status = SourceStatus.AVAILABLE
         last_error = None
         count = 0
@@ -528,6 +548,9 @@ class IncidentContextBuilder:
                 continue
             if deployment is None:
                 continue
+            if deployment.deployment_id in already_collected:
+                continue
+            already_collected.add(deployment.deployment_id)
 
             obs = normalize_deployment(
                 deployment, cluster=settings.cluster_name, incident_id=incident.incident_id

@@ -30,9 +30,16 @@ from app.api.deps import (
     get_evidence_store,
     get_incident_store,
     get_observation_store,
+    get_source_status_store,
     get_topology_store,
 )
-from app.storage.interfaces import EvidenceStore, IncidentStore, ObservationStore, TopologyStore
+from app.storage.interfaces import (
+    EvidenceStore,
+    IncidentStore,
+    ObservationStore,
+    SourceStatusStore,
+    TopologyStore,
+)
 from shared.models import Evidence, Incident, Observation
 
 router = APIRouter(dependencies=[Depends(require_api_key)])
@@ -105,6 +112,33 @@ async def get_incident_evidence(
 ) -> List[Evidence]:
     await _get_incident_or_404(incident_id, incident_store)
     return await evidence_store.list_by_incident(incident_id)
+
+
+@router.get("/incidents/{incident_id}/source-status")
+async def get_incident_source_status(
+    incident_id: str,
+    incident_store: IncidentStore = Depends(get_incident_store),
+    source_status_store: SourceStatusStore = Depends(get_source_status_store),
+):
+    """Per-source AVAILABLE/UNAVAILABLE/TIMEOUT/PARTIAL outcome of the
+    Incident Context Builder's most recent run for this incident (spec
+    section 13/37) — e.g. whether Loki/Tempo/Kubernetes actually
+    succeeded, returned empty, or failed, rather than that being visible
+    only by reading source code or logs."""
+    await _get_incident_or_404(incident_id, incident_store)
+    statuses = await source_status_store.list_by_incident(incident_id)
+    return {
+        "incident_id": incident_id,
+        "source_status": [
+            {
+                "source": s.source,
+                "status": s.status.value,
+                "error": s.error,
+                "observation_count": s.observation_count,
+            }
+            for s in statuses
+        ],
+    }
 
 
 @router.get("/incidents/{incident_id}/timeline")

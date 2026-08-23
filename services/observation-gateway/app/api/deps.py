@@ -10,6 +10,7 @@ from app.storage.interfaces import (
     EvidenceStore,
     IncidentStore,
     ObservationStore,
+    SourceStatusStore,
     TopologyStore,
 )
 from app.topology.service_topology_builder import ServiceTopologyBuilder
@@ -35,6 +36,10 @@ def get_deployment_store(request: Request) -> DeploymentStore:
     return request.app.state.deployment_store
 
 
+def get_source_status_store(request: Request) -> SourceStatusStore:
+    return request.app.state.source_status_store
+
+
 def get_context_builder(request: Request) -> IncidentContextBuilder:
     # Built fresh per request (not cached on app.state) so it always picks
     # up whichever stores are current on app.state — important because the
@@ -51,6 +56,7 @@ def get_context_builder(request: Request) -> IncidentContextBuilder:
         evidence_store=state.evidence_store,
         incident_store=state.incident_store,
         deployment_store=state.deployment_store,
+        source_status_store=state.source_status_store,
     )
 
 
