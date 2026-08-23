@@ -27,7 +27,7 @@ def make_k8s_client(deployment_result=None):
                 image="localhost:5000/cloudmart/order-service:v1",
                 created_at=datetime(2026, 8, 20, 8, 0, tzinfo=timezone.utc),
                 annotations={
-                    "incidentpilot.io/commit-sha": "abc1234def",
+                    "commit-sha": "abc1234def",
                     "incidentpilot.io/branch": "main",
                     "incidentpilot.io/deployed-at": "2026-08-20T09:00:00Z",
                     "deployment.kubernetes.io/revision": "7",
@@ -61,6 +61,39 @@ def test_collect_persists_to_store():
     latest = run(store.get_latest("order-service"))
     assert latest is not None
     assert latest.commit_sha == "abc1234def"
+
+
+def test_collect_reads_the_plain_commit_sha_key_deploy_sh_actually_writes():
+    # Regression test: ecommerce-cloudmart's deploy.sh runs
+    # `kubectl annotate deployment/${svc} ... commit-sha="${COMMIT_SHA}"` —
+    # a plain, non-namespaced key. This collector used to look for
+    # `incidentpilot.io/commit-sha` instead, which deploy.sh never wrote,
+    # so commit_sha silently came back None for every real deployment.
+    # deploy.sh doesn't stamp branch/deployed-at under any key yet either,
+    # so this fixture matches deploy.sh's real (minimal) annotation set.
+    k8s = make_k8s_client(
+        AdapterResult(
+            status=SourceStatus.AVAILABLE,
+            data=DeploymentSummary(
+                name="order-service",
+                namespace="cloudmart-prod",
+                replicas=2,
+                ready_replicas=2,
+                created_at=datetime(2026, 8, 20, 8, 0, tzinfo=timezone.utc),
+                annotations={"commit-sha": "137548fabcdef"},
+            ),
+        )
+    )
+    store = InMemoryDeploymentStore()
+    collector = DeploymentContextCollector(kubernetes=k8s, deployment_store=store)
+
+    deployment, status = run(collector.collect("cloudmart-prod", "order-service"))
+
+    assert status == SourceStatus.AVAILABLE
+    assert deployment.commit_sha == "137548fabcdef"
+    # not stamped by deploy.sh yet — falls back rather than raising
+    assert deployment.branch is None
+    assert deployment.deployed_at == datetime(2026, 8, 20, 8, 0, tzinfo=timezone.utc)
 
 
 def test_collect_falls_back_to_created_at_when_no_deployed_at_annotation():

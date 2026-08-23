@@ -365,7 +365,7 @@ def _deployment_result(**overrides):
         ready_replicas=2,
         created_at=datetime(2026, 8, 20, 8, 0, tzinfo=timezone.utc),
         annotations={
-            "incidentpilot.io/commit-sha": "abc1234def",
+            "commit-sha": "abc1234def",
             "incidentpilot.io/branch": "main",
             "incidentpilot.io/deployed-at": "2026-08-20T09:00:00Z",
             "deployment.kubernetes.io/revision": "7",

@@ -1,11 +1,26 @@
 """
 Deployment context collector — spec section 5.
 
-Reads the annotations deploy.sh stamps on each Deployment
-(`incidentpilot.io/commit-sha`/`branch`/`deployed-at`, added in step 12
-alongside this collector — see the ecommerce-cloudmart repo's deploy.sh)
-plus Kubernetes' own `deployment.kubernetes.io/revision` annotation, and
-turns them into a canonical Deployment record.
+Reads the annotations deploy.sh stamps on each Deployment plus
+Kubernetes' own `deployment.kubernetes.io/revision` annotation, and turns
+them into a canonical Deployment record.
+
+`_COMMIT_SHA_ANNOTATION` is the plain (non-namespaced) `commit-sha` key —
+confirmed 2026-08-24 against the ecommerce-cloudmart repo's actual
+deploy.sh, which runs `kubectl annotate deployment/${svc} ...
+commit-sha="${COMMIT_SHA}"`. An earlier version of this file expected the
+namespaced `incidentpilot.io/commit-sha` instead, which deploy.sh never
+wrote — every deployment lookup silently got `commit_sha=None`. Fixed
+here on the reader side rather than re-annotating deploy.sh, since the
+already-deployed plain key is what's live on the cluster today.
+
+`_BRANCH_ANNOTATION`/`_DEPLOYED_AT_ANNOTATION` stay namespaced
+(`incidentpilot.io/...`) because deploy.sh doesn't stamp branch or
+deployed-at under *any* key yet — that's a separate gap in deploy.sh
+itself (only the commit-sha annotate call exists), not a naming mismatch
+to fix here. Until deploy.sh adds those two annotate calls, `branch` stays
+None and `deployed_at` falls back to the Deployment's Kubernetes
+`created_at` (see `_parse_deployed_at` below) rather than raising.
 
 `success` is derived from the Deployment's *current* live replica counts
 (ready >= desired, none unavailable), not from anything deploy.sh stamps —
@@ -23,7 +38,7 @@ from app.collectors.kubernetes_adapter import DeploymentSummary, KubernetesClien
 from app.storage.interfaces import DeploymentStore
 from shared.models import Deployment
 
-_COMMIT_SHA_ANNOTATION = "incidentpilot.io/commit-sha"
+_COMMIT_SHA_ANNOTATION = "commit-sha"
 _BRANCH_ANNOTATION = "incidentpilot.io/branch"
 _DEPLOYED_AT_ANNOTATION = "incidentpilot.io/deployed-at"
 _ROLLOUT_REVISION_ANNOTATION = "deployment.kubernetes.io/revision"  # k8s's own, not ours
