@@ -39,7 +39,7 @@ spec:
       containers:
         - name: observation-gateway
           image: localhost:5000/incident-pilot-ecommerce/observation-gateway:v1
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - containerPort: 8000
           envFrom:
