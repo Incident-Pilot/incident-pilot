@@ -46,7 +46,7 @@ from app.deployment.deployment_context_collector import DeploymentContextCollect
 from app.normalizers.deployment_normalizer import normalize_deployment
 from app.normalizers.kubernetes_normalizer import normalize_events, normalize_pod_statuses
 from app.normalizers.loki_normalizer import normalize_log_entries
-from app.normalizers.prometheus_normalizer import normalize_metric_series
+from app.normalizers.prometheus_normalizer import summarize_metric_series
 from app.normalizers.tempo_normalizer import normalize_error_spans
 from app.storage.interfaces import (
     DeploymentStore,
@@ -87,6 +87,12 @@ _METRIC_PROBES = {
     "cpu_usage_seconds": 'rate(container_cpu_usage_seconds_total{{namespace="{namespace}",pod=~"{service}.*"}}[5m])',
     "memory_working_set_bytes": 'container_memory_working_set_bytes{{namespace="{namespace}",pod=~"{service}.*"}}',
     "http_error_rate": 'sum(rate(traefik_service_requests_total{{service=~".*{service}.*",code=~"5.."}}[5m]))',
+}
+_METRIC_UNITS = {
+    "pod_restarts": "count",
+    "cpu_usage_seconds": "cores",
+    "memory_working_set_bytes": "bytes",
+    "http_error_rate": "req/s",
 }
 _LOG_ERROR_QUERY_TEMPLATE = '{{namespace="{namespace}"}} |~ "(?i)error|exception|timeout|fail"'
 _MAX_LOG_ENTRIES_PER_SERVICE = 50
@@ -135,6 +141,7 @@ def _evidence_for(
     evidence_type: EvidenceType,
     summary: str,
     query: Optional[str] = None,
+    extra: Optional[dict] = None,
 ) -> Evidence:
     return Evidence(
         evidence_id=f"ev-{uuid4().hex[:12]}",
@@ -146,7 +153,9 @@ def _evidence_for(
         resource=observation.resource,
         summary=summary,
         observation_id=observation.observation_id,
-        raw_reference=RawReference(query=query, trace_id=observation.correlation.trace_id),
+        raw_reference=RawReference(
+            query=query, trace_id=observation.correlation.trace_id, extra=extra or {}
+        ),
     )
 
 
@@ -273,26 +282,38 @@ class IncidentContextBuilder:
                     last_error = adapter_result.error
                     continue
 
-                observations = normalize_metric_series(
+                summary_obs = summarize_metric_series(
                     adapter_result.data,
                     signal=probe_name,
                     cluster=settings.cluster_name,
                     namespace=namespace,
                     service=service,
+                    unit=_METRIC_UNITS.get(probe_name, ""),
+                    window_start=window_start,
+                    window_end=now,
                 )
-                for obs in observations:
-                    linked = _linked(obs, incident.incident_id)
-                    await self._observation_store.save(linked)
-                    result.observation_ids.append(linked.observation_id)
-                    evidence = _evidence_for(
-                        linked,
-                        evidence_type=EvidenceType.METRIC,
-                        summary=f"{probe_name} for {service}: {linked.value}",
-                        query=promql,
-                    )
-                    await self._evidence_store.save(evidence)
-                    result.evidence_ids.append(evidence.evidence_id)
-                    count += 1
+                if summary_obs is None:
+                    continue
+
+                linked = _linked(summary_obs, incident.incident_id)
+                await self._observation_store.save(linked)
+                result.observation_ids.append(linked.observation_id)
+
+                unit = linked.metadata.get("unit") or ""
+                unit_suffix = f" {unit}" if unit else ""
+                evidence = _evidence_for(
+                    linked,
+                    evidence_type=EvidenceType.METRIC,
+                    summary=(
+                        f"{probe_name} for {service}: {linked.metadata['baseline']:.4g}{unit_suffix} "
+                        f"-> {linked.metadata['current']:.4g}{unit_suffix} "
+                        f"({linked.metadata['trend']})"
+                    ),
+                    query=promql,
+                )
+                await self._evidence_store.save(evidence)
+                result.evidence_ids.append(evidence.evidence_id)
+                count += 1
 
         result.source_statuses.append(
             SourceCollectionStatus(
@@ -353,6 +374,12 @@ class IncidentContextBuilder:
                 evidence_type=EvidenceType.LOG,
                 summary=(linked.metadata.get("message") or "")[:200],
                 query=logql,
+                extra={
+                    "message": linked.metadata.get("message"),
+                    "pod": linked.resource,
+                    "container": linked.metadata.get("container"),
+                    "level": linked.labels.get("level"),
+                },
             )
             await self._evidence_store.save(evidence)
             result.evidence_ids.append(evidence.evidence_id)
@@ -419,6 +446,15 @@ class IncidentContextBuilder:
                         evidence_type=EvidenceType.TRACE,
                         summary=f"Error span in trace {summary.trace_id} ({linked.metadata.get('operation')})",
                         query=f"trace_id={summary.trace_id}",
+                        extra={
+                            "trace_id": summary.trace_id,
+                            "span_id": linked.metadata.get("span_id"),
+                            "operation": linked.metadata.get("operation"),
+                            "duration_ms": linked.metadata.get("duration_ms"),
+                            "status": "error",
+                            "start_time": linked.timestamp.isoformat(),
+                            "tags": linked.metadata.get("tags"),
+                        },
                     )
                     await self._evidence_store.save(evidence)
                     result.evidence_ids.append(evidence.evidence_id)

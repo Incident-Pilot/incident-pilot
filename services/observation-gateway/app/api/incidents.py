@@ -159,6 +159,7 @@ async def get_incident_timeline(
             "id": o.observation_id,
             "source": o.source.value,
             "signal": o.signal,
+            "description": f"{o.signal} on {o.service or 'unknown service'}",
         }
         for o in observations
     ] + [
@@ -167,7 +168,9 @@ async def get_incident_timeline(
             "kind": "evidence",
             "id": e.evidence_id,
             "type": e.type.value,
+            "source": e.source.value,
             "summary": e.summary,
+            "description": e.summary,
         }
         for e in evidence
     ]

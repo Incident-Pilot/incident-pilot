@@ -8,6 +8,7 @@ that belongs to step 9, not this module (spec section 6/29 boundary: this
 service collects and normalizes, it does not investigate).
 """
 
+import re
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
@@ -28,6 +29,21 @@ _SERVICE_LABEL_CANDIDATES = ("service", "app", "job", "deployment")
 _RESOURCE_LABEL_CANDIDATES = ("pod", "instance", "container")
 _NAMESPACE_LABEL_CANDIDATES = ("namespace", "kubernetes_namespace")
 
+# `service`/`job`/`app` on a kube-state-metrics-sourced alert (most of
+# kube-prometheus-stack's built-in rules, plus our own aegissre-alerts.yaml
+# ones, run through it) names the *scraper* job, not the workload it's
+# reporting on — confirmed live: a real PodCrashLooping alert on
+# order-service came back with affected_services=["kube-prom-kube-state-metrics"]
+# because that's what the `service` label held, even though `pod`/`container`
+# had the real workload name. When the candidate label matches one of these,
+# fall through to `container`/`pod` instead.
+_SCRAPER_JOB_MARKERS = ("kube-state-metrics", "node-exporter", "cadvisor", "kubelet")
+
+# Deployment-managed pod names end in "-<replicaset-hash>-<pod-hash>" (e.g.
+# "order-service-796984c9db-glkdf"); strip that suffix to recover the
+# workload name.
+_POD_HASH_SUFFIX_RE = re.compile(r"^(?P<base>.+)-[0-9a-z]{6,10}-[0-9a-z]{5}$")
+
 
 def _first_present(labels: Dict[str, str], candidates: tuple) -> Optional[str]:
     for key in candidates:
@@ -35,6 +51,36 @@ def _first_present(labels: Dict[str, str], candidates: tuple) -> Optional[str]:
         if value:
             return value
     return None
+
+
+def _is_scraper_job(value: Optional[str]) -> bool:
+    if not value:
+        return False
+    lowered = value.lower()
+    return any(marker in lowered for marker in _SCRAPER_JOB_MARKERS)
+
+
+def _strip_pod_hash_suffix(name: str) -> str:
+    match = _POD_HASH_SUFFIX_RE.match(name)
+    return match.group("base") if match else name
+
+
+def _derive_service(labels: Dict[str, str]) -> Optional[str]:
+    service = _first_present(labels, _SERVICE_LABEL_CANDIDATES)
+    if service and not _is_scraper_job(service):
+        return service
+
+    # `service`/`job`/`app` names the scraper (or is absent) — recover the
+    # real workload from `container` (usually already the bare workload
+    # name) or `pod` (needs its ReplicaSet/Pod-hash suffix stripped).
+    container = labels.get("container")
+    if container and not _is_scraper_job(container):
+        return container
+    pod = labels.get("pod")
+    if pod:
+        return _strip_pod_hash_suffix(pod)
+
+    return service
 
 
 def _map_severity(labels: Dict[str, str]) -> Severity:
@@ -74,7 +120,7 @@ def normalize_alert(
         severity=_map_severity(labels),
         cluster=cluster,
         namespace=_first_present(labels, _NAMESPACE_LABEL_CANDIDATES),
-        service=_first_present(labels, _SERVICE_LABEL_CANDIDATES),
+        service=_derive_service(labels),
         resource=_first_present(labels, _RESOURCE_LABEL_CANDIDATES),
         signal=alertname,
         labels=labels,
