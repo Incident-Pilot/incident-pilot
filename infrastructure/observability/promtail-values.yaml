@@ -1,0 +1,6 @@
+config:
+  clients:
+    - url: http://loki.observability.svc:3100/loki/api/v1/push
+resources:
+  requests: { cpu: 25m, memory: 50Mi }
+  limits: { cpu: 100m, memory: 100Mi }

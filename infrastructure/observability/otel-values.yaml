@@ -1,0 +1,48 @@
+mode: deployment
+replicaCount: 1
+image:
+  repository: otel/opentelemetry-collector-contrib
+resources:
+  requests: { cpu: 50m, memory: 100Mi }
+  limits: { cpu: 200m, memory: 200Mi }
+
+ports:
+  metrics:
+    enabled: true
+    containerPort: 8888
+    servicePort: 8888
+    protocol: TCP
+  prom-exporter:
+    enabled: true
+    containerPort: 8889
+    servicePort: 8889
+    protocol: TCP
+
+config:
+  receivers:
+    otlp:
+      protocols:
+        grpc: { endpoint: 0.0.0.0:4317 }
+        http: { endpoint: 0.0.0.0:4318 }
+  exporters:
+    prometheus:
+      endpoint: 0.0.0.0:8889
+    otlp/tempo:
+      endpoint: tempo.observability.svc:4317
+      tls: { insecure: true }
+  service:
+    telemetry:
+      metrics:
+        readers:
+          - pull:
+              exporter:
+                prometheus:
+                  host: 0.0.0.0
+                  port: 8888
+    pipelines:
+      traces:
+        receivers: [otlp]
+        exporters: [otlp/tempo]
+      metrics:
+        receivers: [otlp]
+        exporters: [prometheus]

@@ -1,0 +1,14 @@
+resources:
+  requests: { cpu: 10m, memory: 32Mi }
+  limits: { memory: 64Mi }
+config:
+  logLevel: info
+  logFormat: json
+  route:
+    routes:
+      - match:
+          - receiver: loki
+  receivers:
+    - name: loki
+      loki:
+        url: http://loki.observability.svc:3100/loki/api/v1/push

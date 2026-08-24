@@ -1,0 +1,14 @@
+tempo:
+  resources:
+    requests: { cpu: 50m, memory: 150Mi }
+    limits: { cpu: 300m, memory: 300Mi }
+  retention: 24h
+  storage:
+    trace:
+      backend: local
+      local:
+        path: /var/tempo/traces
+  persistence:
+    enabled: true
+    storageClassName: local-path
+    size: 5Gi

@@ -1,0 +1,51 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: aegissre-core-alerts
+  namespace: observability
+  labels: { release: kube-prom }
+spec:
+  groups:
+    - name: aegissre.rules
+      rules:
+        - alert: HighCPU
+          expr: instance:node_cpu_utilisation:rate5m > 0.85
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "Node CPU usage above 85%"
+        - alert: HighMemory
+          expr: (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) > 0.85
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "Node memory usage above 85%"
+        - alert: PodCrashLooping
+          expr: increase(kube_pod_container_status_restarts_total[15m]) > 3
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "Pod {{ $labels.pod }} restarting repeatedly"
+        - alert: PodOOMKilled
+          expr: kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
+          labels: { severity: critical }
+          annotations:
+            summary: "Pod {{ $labels.pod }} was OOMKilled"
+        - alert: ServiceDown
+          expr: up{job=~".*cloudmart.*"} == 0
+          for: 2m
+          labels: { severity: critical }
+          annotations:
+            summary: "{{ $labels.job }} is down"
+        - alert: HighHTTP5xxRate
+          expr: sum(rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[5m])) by (service_name) > 0.05
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "High 5xx rate on {{ $labels.service_name }}"
+        - alert: HighDiskUsage
+          expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) < 0.15
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "Disk usage above 85% on root filesystem"
