@@ -84,6 +84,51 @@ def test_service_label_falls_back_to_job_when_service_missing():
     assert obs.service == "product-service"
 
 
+def test_service_label_pointing_at_scraper_falls_back_to_container():
+    alert = make_alert(
+        labels={
+            "alertname": "PodCrashLooping",
+            "namespace": "cloudmart-prod",
+            "service": "kube-prom-kube-state-metrics",
+            "container": "order-service",
+            "pod": "order-service-796984c9db-glkdf",
+        }
+    )
+    obs = normalize_alert(alert, cluster="c")
+    assert obs.service == "order-service"
+
+
+def test_service_label_pointing_at_scraper_falls_back_to_stripped_pod_when_no_container():
+    alert = make_alert(
+        labels={
+            "alertname": "PodCrashLooping",
+            "namespace": "cloudmart-prod",
+            "service": "kube-prom-kube-state-metrics",
+            "pod": "order-service-796984c9db-glkdf",
+        }
+    )
+    obs = normalize_alert(alert, cluster="c")
+    assert obs.service == "order-service"
+
+
+def test_job_label_pointing_at_node_exporter_falls_back_to_pod():
+    alert = make_alert(
+        labels={
+            "alertname": "X",
+            "job": "node-exporter",
+            "pod": "product-service-6f4d8b9c7-abcde",
+        }
+    )
+    obs = normalize_alert(alert, cluster="c")
+    assert obs.service == "product-service"
+
+
+def test_scraper_service_label_with_no_container_or_pod_keeps_scraper_name():
+    alert = make_alert(labels={"alertname": "X", "service": "kube-state-metrics"})
+    obs = normalize_alert(alert, cluster="c")
+    assert obs.service == "kube-state-metrics"
+
+
 def test_per_alert_labels_win_over_common_labels():
     alert = make_alert(labels={"alertname": "X", "service": "order-service"})
     obs = normalize_alert(

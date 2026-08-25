@@ -161,3 +161,15 @@ Context Builder's `_METRIC_PROBES`/log query/trace search in
 in production rather than just failing closed (which is what they've been
 proven to do safely so far, per the resilience tests in
 `test_incident_context_builder.py`).
+
+**Run 2026-08-20 — results in `docs/PROGRESS.md` Task 13, not here.**
+Summary: Kubernetes and Loki adapters fully confirmed (Loki gained one new
+label candidate, `service_name`); Tempo's real shape turned out to be
+OTLP-JSON rather than Jaeger (fixed, `c33370e`) and the app *does* have
+real OTel instrumentation at runtime; Prometheus is 1-of-4 `_METRIC_PROBES`
+confirmed, 1-of-4 metric-name-exists-but-data-unconfirmed, 2-of-4 still
+untested (`cpu_usage_seconds`, `memory_working_set_bytes` — the curl
+commands to close these out are still in Section 2 above); node disk
+(ephemeral-storage), not memory, is the real eviction trigger. Still open:
+the two remaining Prometheus probes, confirming Alertmanager's routing
+config actually points at the gateway, and disk-pressure remediation.

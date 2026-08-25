@@ -210,6 +210,69 @@ def test_prometheus_unavailable_does_not_block_other_sources():
     assert final.current_phase == IncidentPhase.READY_FOR_INVESTIGATION
 
 
+def test_metrics_collapse_to_one_evidence_per_probe_per_service_not_per_series():
+    # Regression for a real incident where a single probe with many
+    # matching pods (replicas + long-terminated ones still in the series
+    # set) produced dozens of near-identical Evidence rows — one per
+    # series/sample instead of one summary per metric per service.
+    many_pod_series = {
+        "result": [
+            {
+                "metric": {"pod": f"order-service-{i:03d}"},
+                "values": [[1000.0, "0"], [1030.0, "0"], [1060.0, "0"]],
+            }
+            for i in range(40)
+        ]
+    }
+    builder, obs_store, evid_store, incident_store, deployment_store = make_builder(
+        prometheus_result=AdapterResult(status=SourceStatus.AVAILABLE, data=many_pod_series)
+    )
+    incident = make_incident(affected_services=["order-service"])
+    run(incident_store.save(incident))
+
+    result = run(builder.build(incident))
+
+    prom_count = next(s.observation_count for s in result.source_statuses if s.source == "prometheus")
+    # One summary Evidence per metric probe (4 probes) for the one
+    # affected service, regardless of how many pod series matched.
+    assert prom_count == 4
+
+    evidence_list = run(evid_store.list_by_incident(incident.incident_id))
+    metric_evidence = [e for e in evidence_list if e.type.value == "metric"]
+    assert len(metric_evidence) == 4
+
+
+def test_log_evidence_carries_structured_fields_in_raw_reference_extra():
+    builder, obs_store, evid_store, incident_store, deployment_store = make_builder()
+    incident = make_incident()
+    run(incident_store.save(incident))
+    run(builder.build(incident))
+
+    evidence_list = run(evid_store.list_by_incident(incident.incident_id))
+    log_evidence = [e for e in evidence_list if e.type.value == "log"]
+    assert log_evidence
+    extra = log_evidence[0].raw_reference.extra
+    assert extra["message"] == "database connection timeout"
+    assert "pod" in extra and "container" in extra and "level" in extra
+
+
+def test_trace_evidence_carries_structured_fields_in_raw_reference_extra():
+    builder, obs_store, evid_store, incident_store, deployment_store = make_builder()
+    incident = make_incident()
+    run(incident_store.save(incident))
+    run(builder.build(incident))
+
+    evidence_list = run(evid_store.list_by_incident(incident.incident_id))
+    trace_evidence = [e for e in evidence_list if e.type.value == "trace"]
+    assert trace_evidence
+    extra = trace_evidence[0].raw_reference.extra
+    assert extra["trace_id"] == "trace-1"
+    assert extra["span_id"] == "span-1"
+    assert extra["operation"] == "POST /orders"
+    assert extra["duration_ms"] == 50.0
+    assert extra["status"] == "error"
+
+
 def test_tempo_timeout_reported_without_raising():
     builder, obs_store, evid_store, incident_store, deployment_store = make_builder(
         tempo_search_result=AdapterResult(status=SourceStatus.TIMEOUT, error="Tempo request timed out")

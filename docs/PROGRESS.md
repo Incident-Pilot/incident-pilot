@@ -23,11 +23,11 @@ task so a new session can pick up without re-deriving context.
 - [x] 15. Implement PostgreSQL persistence — **DONE this task**
 - [x] 16. Implement incident correlation — **DONE this task**
 - [x] 17. Implement context builder — **DONE this task**
-- [ ] 18. Implement topology
-- [ ] 19. Implement deployment context
-- [ ] 20. Implement security context
-- [ ] 21. Implement API
-- [ ] 22. Deploy to k3s
+- [x] 18. Implement topology — **DONE this task**
+- [x] 19. Implement deployment context — **DONE this task**
+- [x] 20. Implement security context — **DONE this task**
+- [x] 21. Implement API — **DONE this task**
+- [x] 22. Deploy to k3s — **manifests + deploy automation DONE this task; not yet actually applied, see below**
 - [ ] 23. Run controlled failure
 - [ ] 24. Verify complete incident lifecycle
 - [ ] 25. Document architecture
@@ -558,17 +558,592 @@ task so a new session can pick up without re-deriving context.
   exist) and service topology (step 18/11 — needs the dependency graph,
   which doesn't exist). The Context Builder does not attempt either.
 
-### Task 10 — TBD
+### Task 10 — Service topology (DONE)
 
-Per the method sequence, step 18 (service topology) is next. Still
-outstanding, now written up as an actual runnable procedure rather than
-just a note: `docs/LIVE_CLUSTER_VERIFICATION.md` (new this task) is the
-step-by-step for verifying all four adapters — and, critically, the
-`_METRIC_PROBES`/log query/trace search added in this task — against the
-real CloudMart cluster from the EC2 box. Two things flagged as
-highest-value to check first: whether application-level traces exist in
-Tempo *at all* (a separate inspection found no OpenTelemetry SDK in the
-CloudMart app code, which would mean Tempo has nothing to find regardless
-of adapter correctness), and Tempo's live restart status
-(`kubectl describe pod tempo-0 -n observability`), since the Context
-Builder's resilience path was specifically built to tolerate that.
+- New `app/topology/service_topology_builder.py`
+  (`ServiceTopologyBuilder.build(namespace)`), exposed via new
+  `GET /topology` (`app/api/topology.py`). Merges three sources into one
+  adjacency-list graph (spec section 10):
+  1. **Static seed** — the exact call chain the spec documents from the
+     CloudMart app's own code (`frontend -> product-service/order-service/
+     user-service`, `order-service -> product-service/notification-service`).
+     Not an inference; this is what the code does. Matches spec section
+     15's illustrative `"topology"` example edge-for-edge, which is a
+     good sign the seed is right.
+  2. **Kubernetes Services** (`KubernetesClient.list_services`) — adds
+     every Service in the namespace as a node, even ones with no known or
+     observed edges yet, so the graph doesn't silently omit a service
+     just because nothing calls it (yet).
+  3. **Tempo-observed spans** — for each known service, searches recent
+     traces (capped at 5 per service, same pattern as the Context
+     Builder's trace collection) and walks parent/child span pairs: a
+     child span whose `service` differs from its parent's `service` is a
+     real observed call, added as an edge if not already present. Purely
+     structural (reads `Span.service`/`parent_span_id` directly), no
+     inference about which edges "matter."
+  - All three sources merge by union — nothing is scored, weighted, or
+    filtered. Kubernetes or Tempo being unreachable degrades to "topology
+    built from fewer sources" (verified both by test and live run below),
+    never an error; the static seed alone is always enough to answer the
+    endpoint.
+  - New `TopologyStore` Protocol (`app/storage/interfaces.py`) +
+    `InMemoryTopologyStore` + `PostgresTopologyStore` — same
+    Protocol-then-swap pattern as every other store so far, backed by the
+    `service_topology` table that's existed since Task 7's migration but
+    had no store implementation until now. `save_service()` is an upsert
+    keyed on `service` (matches the table's primary key).
+  - `GET /topology` recomputes live on every call (no caching/scheduling
+    layer — topology isn't hit per-incident the way context collection
+    is, so this was judged simple enough not to need one) and persists
+    the result before returning it, so the stored table always reflects
+    the most recent call.
+  - Added `settings.default_namespace` (`cloudmart-prod`) — topology
+    isn't incident-scoped, so it needs its own namespace source instead
+    of reading `incident.affected_namespace`.
+- 7 unit tests (`test_service_topology_builder.py`, mocked K8s/Tempo):
+  static seed alone with no live sources, every service persisted,
+  K8s services added as nodes, K8s-unavailable doesn't block the static
+  seed, a real Tempo-observed span adds a new edge without duplicating an
+  edge the static seed already had, Tempo-unavailable doesn't block K8s
+  or the static seed, and no sources at all still returns the seed
+  without crashing. Plus 2 endpoint tests
+  (`test_topology_api.py`) and 2 new Postgres integration tests
+  (round-trip, upsert) — full Postgres-only suite now 15 passed.
+- **Verified live against the same genuinely-unreachable cluster hosts as
+  Task 9**: started the real server against real local Postgres, `GET
+  /topology` took ~25s (real K8s + 5× real Tempo search attempts each
+  timing out) then correctly fell back to the static seed alone — no
+  crash, 200 OK. Confirmed via raw `psql` that all 5 services (including
+  the two leaf services with empty `depends_on`) were persisted to
+  `service_topology` correctly. Server log showed no unhandled exception.
+  Stopped both afterward.
+- Full in-memory suite: **132 passed, 15 skipped** in 8.6s.
+
+### Task 11 — Deployment context (DONE)
+
+This task touches **two repositories** — noting that explicitly since
+every prior task only touched this one.
+
+- **`ecommerce-cloudmart` repo** (`~/Ascentic/ecommerce-cloudmart-main`
+  locally — not a git repo in this sandbox, so no commit made there, just
+  the file edit): `deploy.sh` now captures `COMMIT_SHA`/`BRANCH`/
+  `DEPLOYED_AT` right after `git pull` and, after the existing `kubectl
+  apply` block (before the rollout restart), loops over the same five
+  services annotating each Deployment: `incidentpilot.io/commit-sha`,
+  `incidentpilot.io/branch`, `incidentpilot.io/deployed-at`. ~10 lines
+  added, nothing else changed — no new files, no image-tagging change, no
+  pipeline redesign, exactly what spec section 5 asked for ("the smallest
+  possible metadata emission"). Verified two ways since there's no live
+  cluster to actually run this against: `bash -n deploy.sh` (syntax
+  check) and a dry run with a fake `kubectl` on `$PATH` that just echoes
+  its args — confirmed the exact five `kubectl annotate` commands
+  construct correctly, with annotation keys matching character-for-character
+  what the gateway-side collector reads (see below).
+- **This repo (`incidentpilot`)**:
+  - `DeploymentSummary` (`app/collectors/kubernetes_adapter.py`) gained
+    an `annotations: Dict[str, str]` field, populated from
+    `dep.metadata.annotations` in `_to_deployment_summary` — the only
+    change to an existing adapter this task made. Additive/optional, so
+    no existing test broke (2 new tests added: annotations preserved,
+    defaults to `{}` when the Deployment has none — e.g. one that
+    predates this task's `deploy.sh` change).
+  - New canonical `Deployment` model (`shared/models/deployment.py`) —
+    `commit_sha`/`branch`/`image_tag`/`rollout_revision`/`deployed_at`/
+    `success`, matching spec section 5's field list exactly. Added
+    `ALTER TABLE deployments ADD COLUMN IF NOT EXISTS branch TEXT` to
+    `schema.sql` — Task 7's original migration missed `branch`; idempotent
+    `ADD COLUMN IF NOT EXISTS` so it's safe against a database that
+    already has the table (verified live, see below).
+  - `DeploymentContextCollector` (`app/deployment/deployment_context_collector.py`):
+    calls `KubernetesClient.get_deployment()`, parses the three
+    `incidentpilot.io/*` annotations plus Kubernetes' **own**
+    `deployment.kubernetes.io/revision` annotation (no app-side change
+    needed for that one — k8s sets it automatically on every Deployment).
+    `success` is deliberately **not** read from an annotation — it's
+    derived from the Deployment's live `ready_replicas`/`replicas`/
+    `unavailable_replicas` at collection time, since a deploy's real
+    outcome isn't known until the rollout actually finishes, and
+    re-checking current status is strictly more accurate than trusting a
+    flag stamped at `kubectl apply` time.
+  - New `normalize_deployment()` (`app/normalizers/deployment_normalizer.py`)
+    turns a `Deployment` into an Observation (`signal_type=DEPLOYMENT_EVENT`,
+    `source=GIT` — matching the source already used in Task 1's own
+    Evidence test fixture, taken as a design-intent signal rather than
+    picked arbitrarily). This keeps deployment evidence on the *same*
+    Observation-then-Evidence provenance chain as every other context
+    source, rather than being a special case with no observation to cite.
+  - `DeploymentStore` Protocol + `InMemoryDeploymentStore` +
+    `PostgresDeploymentStore` — same pattern as every store so far.
+    `get_latest(service)` is the one query the Context Builder needs.
+  - **Wired into the Context Builder** (`_collect_deployment_context`,
+    called from `build()` after Kubernetes events/pods): for each
+    affected service, collects the current Deployment, and if found,
+    creates Evidence with a summary text matching spec section 15's
+    illustrative example exactly — `"order-service deployed 4 minutes
+    before this incident (commit abc1234)"` — a plain time delta between
+    `incident.created_at` and `deployment.deployed_at`, not a causal
+    claim. `deployment` is now a 5th independently-tracked source
+    alongside prometheus/loki/tempo/kubernetes in
+    `IncidentContextResult.source_statuses` — same resilience contract:
+    unreachable K8s reports `deployment: UNAVAILABLE` and every other
+    source still completes.
+  - 7 new tests for the collector (annotation parsing, persistence,
+    missing-`deployed-at` fallback to `created_at`, unreachable ->
+    `(None, status)` not a crash, no-k8s-client -> `UNAVAILABLE`,
+    `success` derivation both ways), 3 for the normalizer, 4 new
+    Context-Builder-level tests (time-delta evidence text end-to-end,
+    evidence cites a real observation, persists to the store, no
+    deployment found -> no evidence but still reaches
+    `READY_FOR_INVESTIGATION`), 4 new shared-model tests for `Deployment`
+    itself, 4 new Postgres integration tests (round-trip including the
+    new `branch` column, `get_latest` picks the most recent, missing
+    service -> `None`, upsert). Full suite: **152 passed, 19 skipped**
+    in-memory; all 19 Postgres-only tests run and passed against the
+    same real local Postgres instance used since Task 7.
+  - **Verified live** (same real-unreachable-cluster rigor as every prior
+    task): real server, real Postgres, POSTed a webhook — response fast
+    as before, background context collection took ~25s working through
+    all five now-tracked sources (the deployment collector's one extra
+    real `get_deployment` call added no meaningfully additional delay),
+    landed on `READY_FOR_INVESTIGATION`, zero unhandled exceptions in the
+    server log. Confirmed via `psql` that `deployments` stayed empty
+    (correct — no reachable cluster to read a real Deployment from) while
+    the alert Evidence still persisted correctly, exactly the same
+    graceful-partial-context behavior proven in Tasks 9-10, now extended
+    to a 5th source.
+
+### Task 12 — Security findings ingestion (DONE)
+
+Also touches both repos, same as Task 11.
+
+- **`ecommerce-cloudmart` repo**: `deploy.sh` now POSTs each report to the
+  gateway right after generating it — `reports/gitleaks-report.json` to
+  `POST /ingest/gitleaks`, each `reports/trivy-${svc}.json` to
+  `POST /ingest/trivy?service=${svc}` — via a new `INCIDENT_GATEWAY_URL`
+  env var. Deliberately **empty by default**: the gateway isn't deployed
+  into the cluster yet (that's step 21/22, still ahead), so there's no
+  real URL to point at yet — same bootstrapping order problem as the
+  Alertmanager webhook's URL (also still unwired, for the same reason).
+  Every curl is guarded (`[ -n "$INCIDENT_GATEWAY_URL" ] && [ -s
+  reports/... ]`) and best-effort (`|| true`), so this never fails a
+  deploy — running with the var unset is a no-op, exactly today's
+  behavior. Verified the exact commands construct correctly via a dry
+  run with a fake `curl`/report files on `$PATH`, **then actually ran
+  the real `curl` commands** (not a fake) against the real running
+  gateway + real Postgres — see below.
+- **This repo**:
+  - `app/models/security_reports.py`: `GitleaksFinding` uses
+    `extra="ignore"` — the *only* payload model in this service that
+    does, deliberately. Real Gitleaks JSON includes the actual leaked
+    secret value in `Secret`/`Match` fields; `extra="ignore"` drops them
+    at parse time, before they become a Python attribute on anything —
+    stronger than "the normalizer just doesn't read that field," since
+    there's nothing for any future code to accidentally read. Verified
+    directly (`not hasattr(finding, "Secret")`), not just inferred.
+  - `normalize_gitleaks_findings()` / `normalize_trivy_report()`
+    (`app/normalizers/`): Gitleaks findings always map to
+    `Severity.CRITICAL` (an actual credential in git history is
+    unambiguously critical, not a judgment call) and derive `service`
+    from the `services/<name>/...` file path convention. Trivy severity
+    is a direct passthrough map (CRITICAL->CRITICAL, HIGH/MEDIUM->WARNING,
+    LOW->INFO, UNKNOWN/anything else->UNKNOWN) — same "map the tool's
+    own label, don't add judgment" discipline as every other normalizer
+    — and derives `service` from `ArtifactName`
+    (`localhost:5000/cloudmart/order-service:v1` -> `order-service`,
+    handling the registry-host-also-has-a-colon gotcha), overridable via
+    an explicit `service` query param. Trivy findings capped at 200,
+    highest-severity-first, since a real image scan can return hundreds
+    of vulnerabilities — the same "don't dump unbounded volume" guard
+    used for Loki log lines.
+  - `POST /ingest/gitleaks` / `POST /ingest/trivy`
+    (`app/api/security_ingestion.py`): both 202 + observation IDs on
+    success, 422 on a malformed body (wrong top-level JSON type), 202
+    with zero observations on an empty/clean report (no findings isn't
+    an error condition). Ingestion only — no blocking of the deploy that
+    triggered the scan, no opinion on `deploy.sh`'s existing
+    non-blocking `--exit-code 0` choice.
+  - 14 normalizer unit tests (severity mapping both directions, service
+    derivation including the registry-colon edge case, capping keeps the
+    most severe, malformed dates, missing fields) + 9 endpoint tests
+    (valid/empty/malformed for both, service-override precedence) — one
+    normalizer test and one endpoint test specifically assert the dummy
+    secret value used in the fixture never appears anywhere in the
+    Observation's serialized output, not just "the field isn't named
+    Secret." Full suite: **175 passed, 19 skipped** (Postgres-only,
+    unaffected by this task — no new Postgres store was needed since
+    security findings reuse `ObservationStore`, already built).
+  - **Verified live, with real (not simulated) `curl` calls**: real
+    server, real Postgres, ran the *actual* `deploy.sh`-shape commands
+    (`curl -sf -X POST .../ingest/gitleaks --data @reports/gitleaks-report.json`,
+    same for trivy) against dummy report files containing a fake secret
+    value (`AKIA_TEST_DUMMY_NOT_REAL_00000000`, never a real credential).
+    Both returned 202 with the right counts. Then, independent of the
+    app, ran a raw SQL query across every text/JSONB column in
+    `observations` (`metadata::text LIKE '%AKIA_TEST_DUMMY%'`, same for
+    `labels`/`signal`/`resource`) — **zero rows**, confirming the secret
+    genuinely never reached the database, not just that the app's own
+    response didn't echo it back. Severity mapping, service derivation,
+    and commit/author metadata all landed correctly. No exceptions in
+    the server log. Stopped both afterward.
+
+**Note found while running the full suite after this task, unrelated to
+anything built here**: `app/collectors/tempo_adapter.py` has been
+substantially rewritten since Task 4/9/10 — its own docstring now says
+the response shape is "CONFIRMED against the live cluster (Tempo 2.9.0)"
+as OTLP-JSON (`batches`/`scopeSpans`), not the originally-assumed
+Jaeger shape, with base64 trace/span IDs and OTLP typed-union attributes
+now handled, and the old Jaeger parser kept as a defensive fallback. This
+is real, valuable live-verification work — presumably yours, done in
+parallel via `docs/LIVE_CLUSTER_VERIFICATION.md` while this task was in
+progress — and I did not touch that file. One pre-existing test,
+`test_parse_spans_treats_error_tag_true_as_error_even_without_status_code`,
+now fails: the new shared `_is_error_span()` helper (used by both the
+OTLP and Jaeger code paths) checks `status.code` and
+`tags["http.status_code"]` but no longer checks a boolean `tags["error"]`
+attribute, which the original Jaeger-only implementation did and which
+that test still expects. Every other test in the suite passes (174
+passed, 19 skipped, 1 deselected when this one test is excluded) — this
+looks like a real, narrow regression from unifying the two code paths'
+error-detection logic, not something in scope for this task to fix,
+since it's inside actively-in-progress work on a file I don't own the
+current edits to.
+
+### Task 13 — Live verification results (Prometheus/Loki/Tempo/K8s adapters, real cluster) + fixes (DONE)
+
+The `docs/LIVE_CLUSTER_VERIFICATION.md` procedure was run for real, in
+parallel with Task 12, against the actual CloudMart EC2/k3s cluster — the
+first genuine live-cluster contact this project has had (every prior task
+was mocked or ran against a scratch local Postgres, explicitly flagged as
+such throughout Tasks 6-12). This session shares the same git checkout as
+that verification work — `git log` shows two of its commits already on
+`main` (`55483de` live_check_loki.py update, `c33370e` Tempo OTLP fix) —
+so results and code changes from that session are directly visible here,
+not just reported secondhand.
+
+**Confirmed, no code changes needed:**
+- **Kubernetes adapter** — `list_pods`/`list_deployments`/`list_events`/
+  `get_nodes` all `available` with real `cloudmart-prod` data. Notably,
+  `list_events()` is what surfaced the real root cause of the node's
+  ongoing pod-eviction problem (see below) — a `Warning: Evicted` event
+  with an explicit `ephemeral-storage` reason, carried through untouched
+  by the adapter's existing raw `reason`/`message` passthrough design, no
+  special-casing needed. Added a confirmation note to the adapter's
+  module docstring.
+- **Loki adapter** — real Promtail labels matched the candidate-list
+  resolution exactly (`namespace`/`pod`/`container` direct,
+  `service` via `app`). One gap found: a `service_name` label also exists
+  on this cluster but wasn't in `_SERVICE_LABEL_CANDIDATES` — currently
+  harmless (`app` already matches first and always agrees with it here),
+  but added as a second candidate for future robustness, plus a new test
+  (`test_parse_entries_service_falls_back_to_service_name_label`).
+- **Auth assumption** (`app/config/settings.py`) — every live call above
+  came back `available`, never 401/403, across Prometheus/Loki/Tempo/K8s.
+  The "treat these as unauthenticated" assumption is now confirmed
+  correct in practice, not just untested; docstring updated to say so.
+
+**Partially confirmed:**
+- **Prometheus adapter / `_METRIC_PROBES`** — `pod_restarts`
+  (`kube_pod_container_status_restarts_total`) confirmed returning real
+  per-pod data. `http_error_rate`'s metric name
+  (`traefik_service_requests_total`) confirmed to exist on this
+  Prometheus, but not yet confirmed to return non-empty data for
+  cloudmart-prod traffic specifically. `cpu_usage_seconds` and
+  `memory_working_set_bytes` — still completely unverified, exactly as
+  originally flagged. Updated the `_METRIC_PROBES` comment in
+  `incident_context_builder.py` to state per-probe status precisely
+  rather than one blanket "unverified" note covering all four unevenly.
+  (Separately confirmed, and worth recording since it could otherwise
+  look like a bug later: a plain `up{namespace="cloudmart-prod"}` query
+  returns empty — expected, not a probe, since there's no ServiceMonitor
+  scraping the app pods directly.)
+
+**Found and already fixed by the parallel session — I verified, did not
+redo:**
+- **Tempo adapter** — real shape is OTLP-JSON (`batches`/`scopeSpans`,
+  base64 trace/span IDs, typed-union attributes), not the originally
+  assumed Jaeger shape. Fixed in `c33370e`, already on `main`. Also
+  confirmed: the app **does** have real OpenTelemetry instrumentation at
+  runtime (a genuine `order-service` Express-middleware span was
+  captured) — this overturns the earlier static-code-inspection finding
+  from the original scenario brief ("no OpenTelemetry SDK anywhere"). Most
+  captured traces this session were kube-probe health checks rather than
+  real order-flow traffic, so an end-to-end test should generate actual
+  app traffic (place a real order) before trusting trace evidence.
+
+**Found by me, fixed this task** — a narrow regression introduced when
+`c33370e` unified the OTLP and Jaeger error-detection paths onto one
+shared `_is_error_span()` helper: it checks `status.code` and
+`http.status_code` but had dropped the boolean `tags["error"]` check the
+original Jaeger-only path had, breaking
+`test_parse_spans_treats_error_tag_true_as_error_even_without_status_code`.
+Restored the check as an additional `or` condition (safe for both paths —
+checking an extra boolean only adds detection coverage, never removes
+any). All 17 Tempo adapter tests pass again; full suite back to 100%
+(176 passed, 19 skipped — one more than Task 12's 175 thanks to the new
+Loki test above).
+
+**Real infrastructure finding, explicitly not this service's job to fix
+(same "infra concern for the user to address separately" boundary the
+original spec brief drew around Tempo's stability) — recorded here so the
+context isn't lost, no code changed in response:**
+- **Node ephemeral storage, not memory, is the actual eviction trigger** —
+  confirmed via a real `Evicted` K8s event: ~870MB free against a ~1.02GB
+  threshold. Likely self-reinforcing: hundreds of uncollected
+  `Evicted`/`Completed`/`Error` pods (some 6+ days old, including ~180
+  from the permanently-broken `kube-events-kubernetes-event-exporter`
+  Deployment) are holding onto logs/writable-layer disk space, which
+  triggers more evictions, which produces more uncollected pods. This is
+  real-world validation that the resilience patterns built across Tasks
+  9-12 (every adapter degrades to `unavailable`/`timeout` rather than
+  failing the whole request) are load-bearing, not defensive-programming
+  theater — remediation (`kubectl delete pods --field-selector=status.phase=Failed`
+  etc.) is a cluster-ops action for you to take, not something this
+  service should ever do automatically (this service does not do
+  Kubernetes writes at all, by design — spec section 3/16).
+
+**Explicitly not evaluated or acted on by me** (yours to resolve, not
+blocking any further build-order step): the `master`/`origin/main`
+branch-divergence git housekeeping on the EC2 clone (this sandbox's
+checkout shows a clean, non-divergent `main` — whatever divergence
+existed was on that other clone, already resolved there per your report),
+and confirming Alertmanager's `alertmanager.yaml` actually routes to the
+gateway's webhook (that's deployment-time wiring, step 22 territory, same
+as the gateway's own in-cluster URL not existing yet for
+`INCIDENT_GATEWAY_URL`/security ingestion in Task 12).
+
+**A note on working concurrently on the same checkout**: this session
+never runs `git commit` unless asked, so all Task 6-13 work (~25 files)
+exists only as uncommitted changes/untracked files in the working tree —
+safely layered on top of whatever the parallel session has committed,
+since committing elsewhere doesn't touch uncommitted local changes. Worth
+being aware of if a destructive git command (`git checkout .`,
+`git reset --hard`) ever runs from either session — it would discard the
+other's in-progress work.
+
+Full suite: **176 passed, 19 skipped** —
+`pytest shared/tests services/observation-gateway/tests -v`.
+
+### Task 14 — API layer + authentication (DONE)
+
+Completes the spec section 12 endpoint list — everything except
+`/health`/`/ready`/`/webhooks/alertmanager` (steps 7, mostly),
+`/topology` (step 11) was still missing until this task.
+
+- **Auth** (`app/api/auth.py`): a single shared `require_api_key`
+  dependency, applied per-router via
+  `APIRouter(dependencies=[Depends(require_api_key)])` — covers
+  webhooks, ingestion, topology/services, and the new incidents routes.
+  `/health`/`/ready` stay exempt (defined directly on `app`, outside any
+  authenticated router) — k8s liveness/readiness probes hit these
+  unauthenticated by convention, and they reveal nothing sensitive.
+  **Fails closed**: an unset `GATEWAY_API_KEY` rejects every protected
+  request with 503, not "no auth" — a missing Kubernetes Secret must
+  never silently become an open gateway. Token comparison uses
+  `hmac.compare_digest` (constant-time), not `==` — avoids a timing
+  side-channel on the secret comparison, unprompted but worth doing by
+  default for anything checking a real credential.
+- **`GET /incidents`** (`app/api/incidents.py`): all incidents, newest
+  first, optional `?status=` filter.
+- **`GET /incidents/{id}`**: composite response matching spec section
+  15's illustrative shape almost exactly — the incident's own fields,
+  plus `observations` (ID list), `evidence` (summarized:
+  `id`/`type`/`summary`), and `topology` (a subgraph limited to
+  `affected_services`, read from the `TopologyStore` — a fast local
+  read, not a fresh live K8s/Tempo rebuild per incident). 404 if the
+  incident doesn't exist.
+- **`GET /incidents/{id}/observations`** / **`/evidence`**: full
+  `Observation`/`Evidence` objects (the composite view above only gives
+  IDs/summaries) — same 404-if-missing-incident behavior, checked
+  explicitly rather than just returning an ambiguous empty list.
+- **`GET /incidents/{id}/timeline`**: observations + evidence merged
+  into one chronologically-sorted list, each entry tagged `kind`
+  (`observation`/`evidence`). Not spec'd in detail, so this shape is a
+  reasonable interpretation, not a fixed contract — the "what happened
+  when" view a future RCA agent or a human would want.
+- **`GET /services`** (added to `app/api/topology.py`, since it's the
+  same data source): flat sorted list of service names from the
+  `TopologyStore` — deliberately minimal (spec section 12 lists the
+  endpoint without further detail); richer per-service status is already
+  available via `/topology` and `/incidents`, no need to duplicate it
+  here.
+- **`ecommerce-cloudmart` repo**: `deploy.sh`'s security-ingestion curls
+  (Task 12) now send `Authorization: Bearer ${INCIDENT_GATEWAY_API_KEY}`
+  — a new env var, same empty-by-default/best-effort treatment as
+  `INCIDENT_GATEWAY_URL` since the gateway isn't deployed yet.
+- 10 new auth tests (`test_api_auth.py`): fail-closed with no key
+  configured, health/ready exempt, missing/wrong/non-Bearer header
+  rejected, correct token accepted, and one representative protected
+  route from each router group. One implementation wrinkle: `Settings`
+  is a frozen dataclass singleton imported by reference everywhere —
+  `monkeypatch.setattr()` can't mutate it (raises `FrozenInstanceError`),
+  so the "configured" test fixture uses `object.__setattr__` directly
+  with explicit teardown instead.
+- 12 new incidents-API tests (`test_incidents_api.py`): empty list,
+  seeded list, newest-first ordering, status filter, 404 on every
+  incident-scoped route for a missing incident, the composite detail
+  response verified field-by-field against real seeded
+  Observations/Evidence/topology (including that topology is correctly
+  *limited* to `affected_services` — seeded an extra unrelated service
+  and asserted it's absent), full-object observations/evidence
+  endpoints, and timeline ordering. Plus 2 new `/services` tests.
+  Updated the 3 existing webhook/topology/ingestion test fixtures to
+  bypass auth via a new shared `bypass_auth` fixture
+  (`tests/conftest.py`) — those tests are about that endpoint's own
+  logic, not auth, which now has its own dedicated coverage. Full suite:
+  **200 passed, 19 skipped**.
+- **Verified live**: real server, real Postgres, a real
+  `GATEWAY_API_KEY`. Confirmed directly against the running server (not
+  just tests) that no-auth and wrong-key requests both get 401 and the
+  correct token gets 200. Then ran the *entire* pipeline authenticated
+  end to end: POSTed a real webhook, waited for the background Context
+  Builder to reach `ready_for_investigation`, built topology, then hit
+  every new endpoint — `/services`, `/incidents`, `/incidents/{id}`
+  (composite shape matched spec section 15's example field-for-field),
+  `/incidents/{id}/observations`, `/incidents/{id}/timeline`, and a 404
+  for a nonexistent incident. Cross-checked `incidents` and
+  `service_topology` via raw `psql`, independent of the app. Zero
+  exceptions across the entire server log for the whole session
+  (`grep -c "Traceback\|ERROR"` → 0). Stopped both afterward.
+
+### Task 15 — TBD
+
+Per the method sequence, step 22 (deploy this service into k3s — new
+`incident-pilot-ecommerce` namespace, per spec section 3) is next: write
+the actual Kubernetes manifests (Deployment, Service, the `GATEWAY_API_KEY`
+Secret, Postgres + Redis if not already running there, resource
+requests/limits sized per the original node-memory guidance) and get this
+running in-cluster for real, rather than the scratch-Postgres-plus-local-
+uvicorn pattern every task so far has used for live verification. Redis
+itself (spec section 11's buffering/caching store) still hasn't been
+built at all — worth deciding whether that happens as part of this step
+or gets its own. Still outstanding: the two unconfirmed Prometheus
+`_METRIC_PROBES`, and Alertmanager's actual routing config.
+
+### Task 15 — K8s manifests + deploy automation (DONE — not yet applied)
+
+**Honest caveat up front**: this sandbox has no live cluster access (same
+limitation flagged since Task 6), so nothing below has actually been
+`kubectl apply`'d against the real cluster. What's DONE is everything
+that *can* be done without that access: a working Dockerfile, complete
+manifests, deploy automation, and the strongest local proof available
+short of a real cluster. Running `deploy.sh` (or the new GH Actions
+workflow) from the EC2 box is the remaining step, and it's genuinely
+just running it — nothing here is a draft.
+
+- **`services/observation-gateway/Dockerfile`**: build context must be
+  the *repo root*, not the service directory — the app imports
+  `shared.models`, which lives outside `services/observation-gateway`,
+  so both trees need to land in the image (`docker build -f
+  services/observation-gateway/Dockerfile .`). `python:3.11-slim`, runs
+  as a non-root user (uid 10001), `PYTHONPATH=/app` recreating the same
+  import layout local dev already relies on (pytest run from repo root
+  with `app`/`shared` both top-level-importable).
+- **`infrastructure/kubernetes/`** (5 files, 10 resources, all validated
+  as syntactically correct YAML — `yaml.safe_load_all` over every file):
+  - `namespace.yaml` — `incident-pilot-ecommerce`, same label style as
+    CloudMart's own `namespace.yaml`.
+  - `rbac.yaml` — ServiceAccount + a **namespaced** `Role`/`RoleBinding`
+    living in `cloudmart-prod` (not a `ClusterRole`), so the gateway
+    gets read access to that one namespace without cluster-wide
+    privilege — a `RoleBinding` can bind a ServiceAccount from a
+    *different* namespace, which is what makes this possible. Scoped to
+    exactly what's actually called today
+    (`pods`/`events`/`services`/`deployments`, all `get`/`list` only,
+    never write) — `KubernetesClient` has methods for
+    nodes/namespaces/configmaps/secrets/replicasets too, but nothing in
+    the application calls them yet, so no RBAC is granted for them
+    either. Notably: **no `get`/`list` on `secrets` at all**, so the
+    gateway's own ServiceAccount can never read Secret values even by
+    mistake, regardless of what `list_secret_metadata()`'s code
+    discipline promises — this closes the gap that a broader
+    `ClusterRole` would have left open (K8s RBAC has no way to grant
+    "list only metadata" on Secrets; the only real fix is not granting
+    the verb at all when nothing needs it).
+  - `configmap.yaml` — the four telemetry base URLs +
+    `CLUSTER_NAME`/`DEFAULT_NAMESPACE`, already-verified-live values
+    from Task 13.
+  - `postgres.yaml` — a plain `Deployment` + PVC, not a `StatefulSet`
+    (single-replica non-HA DB, Phase 2A scope — StatefulSet's ordered-
+    scaling guarantees buy nothing here). `strategy: Recreate`, not the
+    Deployment default `RollingUpdate` — with one `ReadWriteOnce`
+    volume, a rolling update would try to schedule the new pod before
+    killing the old one and fail to mount. Password/DSN come from a
+    `postgres-credentials` Secret this manifest does **not** create —
+    bootstrap command documented in the new
+    `infrastructure/kubernetes/README.md`, never committed here.
+  - `deployment.yaml` — the gateway Deployment + Service. Same
+    not-committed-Secret treatment for `gateway-credentials` (the step
+    14 API key). Resources sized per the original node-memory guidance
+    (Postgres 256Mi/512Mi request/limit, gateway 128Mi/256Mi).
+  - `README.md` — the bootstrap commands (both Secrets), what
+    `deploy.sh` applies and in what order, and an explicit "what's
+    deliberately not here yet" section (Redis, Alertmanager's own config,
+    any external exposure — none of those are this task's job).
+- **`deploy.sh`** (repo root, mirrors `ecommerce-cloudmart`'s structure
+  per spec section 3 point 2): git pull, Gitleaks scan, build/tag/push
+  the gateway image, Trivy scan, `kubectl apply` the 5 manifests in
+  dependency order, rollout restart + status wait. Then — reusing the
+  exact ingestion endpoints from Task 13 rather than building anything
+  new — feeds its own Gitleaks/Trivy reports into the gateway it just
+  deployed, guarded by `GATEWAY_API_KEY`/best-effort (`|| true`) the same
+  way Task 13's `ecommerce-cloudmart` wiring already was. Also updated
+  `ecommerce-cloudmart`'s `deploy.sh`: `INCIDENT_GATEWAY_URL` now
+  defaults to the real Service DNS name
+  (`observation-gateway.incident-pilot-ecommerce.svc.cluster.local:8000`)
+  instead of empty — safe to set now that this task defines that name for
+  real, and still harmless before the Service exists or before the API
+  key is configured (unreachable/401 both silently swallowed by the
+  existing `|| true` guards). This closes a gap explicitly flagged as
+  open since Task 12.
+- **`.github/workflows/deploy.yml`** — structurally identical to
+  `ecommerce-cloudmart`'s (same `appleboy/ssh-action`, same
+  `EC2_HOST`/`EC2_USER`/`EC2_SSH_KEY` secrets, reused as-is per spec),
+  pointing at `~/incident-pilot-ecommerce/deploy.sh`. One addition:
+  forwards a new `GATEWAY_API_KEY` repo secret into the remote script's
+  environment via the action's `envs` input, needed for the
+  self-ingestion step above.
+- **Validation performed without live cluster access:**
+  - All 5 YAML files parsed successfully via `yaml.safe_load_all`,
+    confirming 10 resources with the expected `kind`/`name` — this is
+    *not* full API-server schema validation (`kubectl apply
+    --dry-run=client` itself tried to reach the cluster's API discovery
+    endpoint even with `--validate=false`, and failed the same way every
+    other live-cluster call from this sandbox has — genuinely can't be
+    done from here).
+  - `bash -n` on both `deploy.sh` files.
+  - **The strongest substitute available for an actual `docker build`**:
+    the Docker daemon isn't reachable in this sandbox either (`docker
+    info` hung the same way `docker ps` did earlier in the project — a
+    pre-existing sandbox limitation, not new). Instead of skipping
+    validation entirely, replicated the *exact* file layout the
+    Dockerfile's `COPY` instructions produce (`shared/` and `app/` both
+    copied into one directory) in the scratchpad, then ran the *exact*
+    `CMD` (`uvicorn app.main:app --host 0.0.0.0 --port 8000`) from
+    there with the *exact* env vars `configmap.yaml`/the two Secrets
+    would inject, against a real local Postgres. Confirmed: `/health`
+    and `/ready` respond, an unauthenticated request to `/topology`
+    correctly gets 401, and a fully authenticated webhook POST creates a
+    real incident — verified independently via `psql`, not just the
+    app's own response. Zero exceptions in the process log. This proves
+    the Dockerfile's COPY paths, `PYTHONPATH`, and `CMD` are all correct
+    — the only thing an actual `docker build` would additionally prove
+    is that the `pip install` layer succeeds in the `python:3.11-slim`
+    base image specifically, which wasn't verifiable from here.
+- Full app test suite unaffected by this task (infra-only changes):
+  **200 passed, 19 skipped**, unchanged from Task 14.
+
+### Task 16 — TBD
+
+Per the method sequence, step 23 (run a controlled fault-injection
+scenario end to end against the real deployment) is next — but needs
+Task 15's manifests actually applied first, which needs the EC2/k3s
+session, not this sandbox. Once applied: bootstrap the two Secrets
+(`infrastructure/kubernetes/README.md`), confirm the gateway pod comes up
+healthy, wire Alertmanager's receiver config at the real
+`gateway-credentials` API key, then break something real in CloudMart
+(recommended in the original spec: a bad image tag or crashing env var on
+order-service) and confirm the full path fires — Prometheus alert →
+Alertmanager → webhook → incident → context collection → visible via the
+real in-cluster API, not a local scratch server. Also still open, carried
+forward: the two unconfirmed Prometheus `_METRIC_PROBES`, and Redis
+(still not built at all).

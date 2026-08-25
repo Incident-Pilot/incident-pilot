@@ -222,6 +222,13 @@ def test_get_incident_timeline_sorted_chronologically(client):
     assert len(timeline) == 2
     assert timeline[0]["kind"] == "observation"
     assert timeline[1]["kind"] == "evidence"
+    # Every entry needs timestamp/description/source regardless of kind, so
+    # a consumer can build a flat TimelineEvent without kind-specific logic.
+    for entry in timeline:
+        assert entry["timestamp"]
+        assert entry["description"]
+        assert entry["source"]
+    assert timeline[1]["source"] == "prometheus"
 
 
 def test_get_incident_timeline_404_for_missing_incident(client):
