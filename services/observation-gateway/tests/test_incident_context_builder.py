@@ -9,7 +9,7 @@ from app.collectors.kubernetes_adapter import KubernetesClient
 from app.collectors.loki_adapter import LokiClient
 from app.collectors.prometheus_adapter import PrometheusClient
 from app.collectors.tempo_adapter import TempoClient
-from app.context.incident_context_builder import IncidentContextBuilder
+from app.context.incident_context_builder import _METRIC_PROBES, IncidentContextBuilder
 from app.storage.memory import (
     InMemoryDeploymentStore,
     InMemoryEvidenceStore,
@@ -233,13 +233,13 @@ def test_metrics_collapse_to_one_evidence_per_probe_per_service_not_per_series()
     result = run(builder.build(incident))
 
     prom_count = next(s.observation_count for s in result.source_statuses if s.source == "prometheus")
-    # One summary Evidence per metric probe (4 probes) for the one
-    # affected service, regardless of how many pod series matched.
-    assert prom_count == 4
+    # One summary Evidence per metric probe for the one affected service,
+    # regardless of how many pod series matched.
+    assert prom_count == len(_METRIC_PROBES)
 
     evidence_list = run(evid_store.list_by_incident(incident.incident_id))
     metric_evidence = [e for e in evidence_list if e.type.value == "metric"]
-    assert len(metric_evidence) == 4
+    assert len(metric_evidence) == len(_METRIC_PROBES)
 
 
 def test_log_evidence_carries_structured_fields_in_raw_reference_extra():

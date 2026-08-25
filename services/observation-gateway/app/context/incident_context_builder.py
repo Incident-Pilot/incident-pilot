@@ -68,31 +68,73 @@ from shared.models import (
 
 # Query selection (spec section 12's "later concern", decided here — the
 # adapters themselves stay generic). These are the standard cAdvisor /
-# kube-state-metrics / Traefik metric names kube-prometheus-stack exports
-# by default. Live verification status per probe (2026-08-20, see
+# kube-state-metrics metric names kube-prometheus-stack exports by
+# default. Live verification status per probe (2026-08-20, see
 # docs/LIVE_CLUSTER_VERIFICATION.md and docs/PROGRESS.md):
 #   - pod_restarts (kube_pod_container_status_restarts_total): CONFIRMED —
 #     real per-pod data returned for namespace="cloudmart-prod".
-#   - http_error_rate (traefik_service_requests_total): metric name
-#     CONFIRMED to exist on this Prometheus; not yet confirmed to return
-#     non-empty data for cloudmart-prod traffic specifically.
 #   - cpu_usage_seconds / memory_working_set_bytes: NOT yet run against
 #     the live cluster — still exactly the "unverified assumption" this
 #     comment originally described. If a probe comes back empty against a
 #     service known to be running and generating load, the metric/label
 #     name here is wrong for this cluster; nothing else depends on the
 #     exact string, so fixing it is a one-line change.
+#
+# http_error_rate / http_requests_total / http_5xx_total (2026-08-26, see
+# HighHTTPErrorRate incidents INC-FD9FA255/INC-1E6E72A9/INC-BDC884BC,
+# which had zero HTTP evidence despite `http_error_rate` already being
+# defined below): live-checked directly against the cluster (SSH to the
+# CloudMart EC2 box, port-forwarded Prometheus — see
+# docs/LIVE_CLUSTER_VERIFICATION.md). Two real, distinct causes:
+#   1. `http_error_rate`'s `service=~".*{service}.*"` matched Traefik's
+#      OWN `service` label, which on `traefik_service_requests_total` is
+#      *always* the literal string "traefik" (the router's own service),
+#      never the backend name — so it never matched anything. The
+#      per-backend identity Traefik actually exposes is the
+#      `exported_service` label (e.g.
+#      "cloudmart-prod-frontend-80@kubernetes"). Fixed below.
+#   2. Even fixed, `http_error_rate` can only ever produce evidence for
+#      `frontend` — it's the only cloudmart-prod service with a Traefik
+#      Ingress (`kubectl get ingress -n cloudmart-prod`); order-service /
+#      product-service / user-service / notification-service are
+#      ClusterIP-only and never pass through Traefik. Those four ARE
+#      individually OTel-instrumented (OTEL_EXPORTER_OTLP_ENDPOINT ->
+#      otel-collector, scraped by Prometheus via
+#      otel-collector-app-metrics ServiceMonitor) and report real
+#      app-level HTTP status codes per service via `exported_job` — but
+#      under two different metric names depending on runtime/semconv
+#      version: Python/Flask services (product-service, user-service)
+#      emit `http_server_duration_milliseconds_count` with
+#      `http_status_code`; Node/Express services (order-service,
+#      notification-service) emit
+#      `http_server_request_duration_seconds_count` with
+#      `http_response_status_code`. `http_requests_total`/`http_5xx_total`
+#      below use PromQL `or` to cover both without branching in code —
+#      whichever family a given service actually emits is the one that
+#      returns data. `frontend` has neither (it's static/nginx, not OTel
+#      instrumented), which is exactly why `http_error_rate` (Traefik)
+#      still earns its place alongside these two.
 _METRIC_PROBES = {
     "pod_restarts": 'kube_pod_container_status_restarts_total{{namespace="{namespace}",pod=~"{service}.*"}}',
     "cpu_usage_seconds": 'rate(container_cpu_usage_seconds_total{{namespace="{namespace}",pod=~"{service}.*"}}[5m])',
     "memory_working_set_bytes": 'container_memory_working_set_bytes{{namespace="{namespace}",pod=~"{service}.*"}}',
-    "http_error_rate": 'sum(rate(traefik_service_requests_total{{service=~".*{service}.*",code=~"5.."}}[5m]))',
+    "http_error_rate": 'sum(rate(traefik_service_requests_total{{exported_service=~".*{service}.*",code=~"5.."}}[5m]))',
+    "http_requests_total": (
+        'sum(rate(http_server_duration_milliseconds_count{{exported_job=~".*{service}.*"}}[5m]))'
+        ' or sum(rate(http_server_request_duration_seconds_count{{exported_job=~".*{service}.*"}}[5m]))'
+    ),
+    "http_5xx_total": (
+        'sum(rate(http_server_duration_milliseconds_count{{exported_job=~".*{service}.*",http_status_code=~"5.."}}[5m]))'
+        ' or sum(rate(http_server_request_duration_seconds_count{{exported_job=~".*{service}.*",http_response_status_code=~"5.."}}[5m]))'
+    ),
 }
 _METRIC_UNITS = {
     "pod_restarts": "count",
     "cpu_usage_seconds": "cores",
     "memory_working_set_bytes": "bytes",
     "http_error_rate": "req/s",
+    "http_requests_total": "req/s",
+    "http_5xx_total": "req/s",
 }
 _LOG_ERROR_QUERY_TEMPLATE = '{{namespace="{namespace}"}} |~ "(?i)error|exception|timeout|fail"'
 _MAX_LOG_ENTRIES_PER_SERVICE = 50
