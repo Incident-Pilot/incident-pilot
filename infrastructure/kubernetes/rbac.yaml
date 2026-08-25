@@ -1,16 +1,15 @@
 # RBAC for the observation-gateway's read-only Kubernetes adapter
 # (spec section 15: "Do NOT implement write operations in this phase" —
-# this ClusterRole/Role only ever grants get/list, never write verbs).
+# this ClusterRole only ever grants get/list, never write verbs).
 #
-# Scoped as a namespaced Role in cloudmart-prod (not a ClusterRole) so the
-# gateway can read that namespace's pods/events/deployments/services
-# without cluster-wide access — a RoleBinding can bind a ServiceAccount
-# from a *different* namespace (incident-pilot-ecommerce) as long as the
-# Role/RoleBinding themselves live in the target namespace. This is a
-# purely additive resource in cloudmart-prod (no existing CloudMart
-# resource is modified), consistent with "preserve cloudmart-prod
-# untouched" — same category of change as the earlier Alertmanager
-# webhook config addition.
+# Scoped as a ClusterRole, not a namespaced Role: the adapter calls the
+# all-namespaces list methods (e.g. list_pod_for_all_namespaces()), and no
+# namespaced Role/RoleBinding combination — no matter how many namespaces
+# you add one for — can authorize that API call. Only a cluster-scoped
+# Role can. This does mean read access (get/list only, no writes) extends
+# to every namespace on the cluster, not just the ones currently in use;
+# accepted for simplicity over chasing per-namespace Roles for each new
+# namespace that appears.
 #
 # Deliberately scoped to only what's actually called today —
 # `list_pods`/`list_events`/`get_deployment`/`list_services` (Context
@@ -27,10 +26,9 @@ metadata:
   namespace: incident-pilot-ecommerce
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+kind: ClusterRole
 metadata:
   name: observation-gateway-reader
-  namespace: cloudmart-prod
 rules:
   - apiGroups: [""]
     resources: ["pods", "events", "services"]
@@ -40,15 +38,14 @@ rules:
     verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: ClusterRoleBinding
 metadata:
   name: observation-gateway-reader-binding
-  namespace: cloudmart-prod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: observation-gateway-reader
 subjects:
   - kind: ServiceAccount
     name: observation-gateway
     namespace: incident-pilot-ecommerce
-roleRef:
-  kind: Role
-  name: observation-gateway-reader
-  apiGroup: rbac.authorization.k8s.io
