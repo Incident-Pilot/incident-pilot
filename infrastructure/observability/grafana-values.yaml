@@ -1,0 +1,29 @@
+resources:
+  requests: { cpu: 50m, memory: 100Mi }
+  limits: { cpu: 200m, memory: 200Mi }
+persistence:
+  enabled: true
+  storageClassName: local-path
+  size: 2Gi
+adminPassword: "luke2026"
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        url: http://kube-prom-kube-prometheus-prometheus.observability.svc:9090
+        isDefault: true
+      - name: Loki
+        type: loki
+        url: http://loki.observability.svc:3100
+      - name: Tempo
+        type: tempo
+        url: http://tempo.observability.svc:3200
+        jsonData:
+          tracesToLogsV2:
+            datasourceUid: loki
+ingress:
+  enabled: true
+  ingressClassName: traefik
+  hosts: ["grafana.100.53.242.19.nip.io"]
