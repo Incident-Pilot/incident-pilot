@@ -34,9 +34,12 @@ spec:
         - alert: ServiceDown
           expr: absent(up{job=~".*cloudmart.*"} == 1)
           for: 2m
-          labels: { severity: critical }
+          labels:
+            severity: critical
+            namespace: cloudmart-prod
+            service: unknown
           annotations:
-            summary: "{{ $labels.job }} is down"
+            summary: "A cloudmart service target has disappeared entirely"
         - alert: HighHTTP5xxRate
           expr: sum(rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[5m])) by (service_name) > 0.05
           for: 5m
