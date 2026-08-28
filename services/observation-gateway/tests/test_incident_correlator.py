@@ -207,6 +207,97 @@ def test_well_labeled_alert_does_not_log_degraded_correlation_warning(caplog):
     assert caplog.records == []
 
 
+def make_cluster_scoped_alert(alertname: str, **overrides):
+    """A firing observation+payload pair for a cluster-scoped alert with no
+    namespace/service label at all — e.g. KubeControllerManagerDown, which
+    (confirmed live) recurred as 5 separate incidents in a day instead of
+    correlating into one, because find_correlation_candidates used to
+    unconditionally return [] whenever services was empty."""
+    obs = make_observation(
+        namespace=None, service=None, resource=None, signal=alertname,
+        labels={"alertname": alertname, "severity": "critical"},
+        **overrides,
+    )
+    payload = make_payload(
+        groupLabels={"alertname": alertname},
+        alerts=[
+            {
+                "status": "firing",
+                "labels": {"alertname": alertname, "severity": "critical"},
+                "annotations": {},
+                "startsAt": "2026-08-19T09:30:00Z",
+            }
+        ],
+    )
+    return obs, payload
+
+
+def test_cluster_scoped_alert_recurring_correlates_into_one_incident():
+    store = InMemoryIncidentStore()
+
+    first = None
+    for _ in range(5):
+        obs, payload = make_cluster_scoped_alert("KubeControllerManagerDown")
+        incident = run(correlate_or_create_incident([obs], payload, store))
+        first = first or incident
+
+    assert incident.incident_id == first.incident_id
+    assert incident.affected_services == []
+    assert incident.affected_namespace is None
+    assert incident.initial_alerts == ["KubeControllerManagerDown"]
+    assert len(run(store.list_all())) == 1
+
+
+def test_cluster_scoped_alert_recurrence_after_resolved_creates_new_incident():
+    store = InMemoryIncidentStore()
+    obs, payload = make_cluster_scoped_alert("KubeControllerManagerDown")
+    first = run(correlate_or_create_incident([obs], payload, store))
+
+    resolved = first.model_copy(update={"status": IncidentStatus.RESOLVED})
+    run(store.save(resolved))
+
+    obs2, payload2 = make_cluster_scoped_alert("KubeControllerManagerDown")
+    second = run(correlate_or_create_incident([obs2], payload2, store))
+
+    assert second.incident_id != first.incident_id
+    assert len(run(store.list_all())) == 2
+
+
+def test_different_cluster_scoped_alertnames_do_not_merge():
+    store = InMemoryIncidentStore()
+    obs1, payload1 = make_cluster_scoped_alert("KubeControllerManagerDown")
+    first = run(correlate_or_create_incident([obs1], payload1, store))
+
+    obs2, payload2 = make_cluster_scoped_alert("KubeSchedulerDown")
+    second = run(correlate_or_create_incident([obs2], payload2, store))
+
+    assert second.incident_id != first.incident_id
+    assert len(run(store.list_all())) == 2
+
+
+def test_cluster_scoped_alert_does_not_merge_into_namespaced_incident_with_same_name():
+    # A namespaced incident that happens to also have no derivable service
+    # (affected_services == []) must not be treated as the same recurring
+    # cluster-wide condition just because the alertname matches — the
+    # namespace null-safety in the fallback query still applies.
+    store = InMemoryIncidentStore()
+    namespaced_obs = make_observation(
+        namespace="cloudmart-prod", service=None, resource=None, signal="KubeControllerManagerDown",
+        labels={"alertname": "KubeControllerManagerDown", "severity": "critical"},
+    )
+    namespaced_payload = make_payload(
+        groupLabels={"alertname": "KubeControllerManagerDown", "namespace": "cloudmart-prod"},
+    )
+    first = run(correlate_or_create_incident([namespaced_obs], namespaced_payload, store))
+    assert first.affected_namespace == "cloudmart-prod"
+
+    obs2, payload2 = make_cluster_scoped_alert("KubeControllerManagerDown")
+    second = run(correlate_or_create_incident([obs2], payload2, store))
+
+    assert second.incident_id != first.incident_id
+    assert len(run(store.list_all())) == 2
+
+
 def test_multiple_candidates_tie_break_to_most_recently_updated():
     store = InMemoryIncidentStore()
     older = run(correlate_or_create_incident([make_observation()], make_payload(), store))

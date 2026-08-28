@@ -245,12 +245,47 @@ async def test_find_correlation_candidates_requires_service_overlap(pool):
 
 
 @pytest.mark.anyio
-async def test_find_correlation_candidates_empty_services_returns_nothing(pool):
+async def test_find_correlation_candidates_empty_services_and_no_alertnames_returns_nothing(pool):
     store = PostgresIncidentStore(pool)
     await store.save(make_incident())
 
     candidates = await store.find_correlation_candidates(
         namespace="cloudmart-prod", services=[], since=datetime.now(timezone.utc)
+    )
+    assert candidates == []
+
+
+@pytest.mark.anyio
+async def test_find_correlation_candidates_empty_services_falls_back_to_alertname(pool):
+    store = PostgresIncidentStore(pool)
+    cluster_incident = make_incident(
+        incident_id="INC-CLUSTER1",
+        affected_services=[],
+        affected_namespace=None,
+        initial_alerts=["KubeControllerManagerDown"],
+    )
+    await store.save(cluster_incident)
+
+    candidates = await store.find_correlation_candidates(
+        namespace=None,
+        services=[],
+        since=datetime.now(timezone.utc) - timedelta(minutes=15),
+        alertnames=["KubeControllerManagerDown"],
+    )
+    assert [c.incident_id for c in candidates] == [cluster_incident.incident_id]
+
+
+@pytest.mark.anyio
+async def test_find_correlation_candidates_alertname_fallback_ignores_incidents_with_services(pool):
+    store = PostgresIncidentStore(pool)
+    normal_incident = make_incident()  # affected_services=["order-service"]
+    await store.save(normal_incident)
+
+    candidates = await store.find_correlation_candidates(
+        namespace="cloudmart-prod",
+        services=[],
+        since=datetime.now(timezone.utc) - timedelta(minutes=15),
+        alertnames=["HighHTTPErrorRate"],
     )
     assert candidates == []
 

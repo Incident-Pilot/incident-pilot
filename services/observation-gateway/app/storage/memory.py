@@ -48,17 +48,36 @@ class InMemoryIncidentStore:
         return list(self._by_id.values())
 
     async def find_correlation_candidates(
-        self, namespace: Optional[str], services: List[str], since: datetime
+        self,
+        namespace: Optional[str],
+        services: List[str],
+        since: datetime,
+        alertnames: Optional[List[str]] = None,
     ) -> List[Incident]:
-        if not services:
+        if services:
+            service_set = set(services)
+            return [
+                incident
+                for incident in self._by_id.values()
+                if incident.status == IncidentStatus.OPEN
+                and incident.affected_namespace == namespace
+                and service_set.intersection(incident.affected_services)
+                and incident.updated_at >= since
+            ]
+
+        # No derivable service (cluster-scoped alert) — fall back to
+        # alertname among other service-less incidents, same rule as
+        # PostgresIncidentStore.find_correlation_candidates.
+        if not alertnames:
             return []
-        service_set = set(services)
+        alertname_set = set(alertnames)
         return [
             incident
             for incident in self._by_id.values()
             if incident.status == IncidentStatus.OPEN
             and incident.affected_namespace == namespace
-            and service_set.intersection(incident.affected_services)
+            and not incident.affected_services
+            and alertname_set.intersection(incident.initial_alerts)
             and incident.updated_at >= since
         ]
 

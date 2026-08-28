@@ -34,13 +34,24 @@ class IncidentStore(Protocol):
     async def list_all(self) -> List[Incident]: ...
 
     async def find_correlation_candidates(
-        self, namespace: Optional[str], services: List[str], since: datetime
+        self,
+        namespace: Optional[str],
+        services: List[str],
+        since: datetime,
+        alertnames: Optional[List[str]] = None,
     ) -> List[Incident]:
         """OPEN incidents matching spec section 7's deterministic dedup
         rule: same namespace, at least one overlapping service, updated
         within the correlation window (`since`). Used by
-        app/correlation/incident_correlator.py — never returns anything
-        if `services` is empty, since namespace alone isn't a safe match."""
+        app/correlation/incident_correlator.py.
+
+        When `services` is empty (a cluster-scoped alert with no
+        derivable service, e.g. KubeControllerManagerDown), namespace
+        alone isn't a safe match — instead falls back to `alertnames`
+        against other equally service-less OPEN incidents, so a
+        cluster-wide condition still dedups against its own past
+        recurrences without namespace/service ever being compared across
+        genuinely unrelated alerts."""
         ...
 
 

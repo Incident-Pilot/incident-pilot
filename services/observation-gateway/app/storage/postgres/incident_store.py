@@ -78,9 +78,36 @@ class PostgresIncidentStore:
         return [row_to_incident(row) for row in rows]
 
     async def find_correlation_candidates(
-        self, namespace: Optional[str], services: List[str], since: datetime
+        self,
+        namespace: Optional[str],
+        services: List[str],
+        since: datetime,
+        alertnames: Optional[List[str]] = None,
     ) -> List[Incident]:
-        if not services:
+        if services:
+            rows = await self._pool.fetch(
+                """
+                SELECT * FROM incidents
+                WHERE status = 'open'
+                  AND affected_namespace IS NOT DISTINCT FROM $1
+                  AND updated_at >= $2
+                  AND affected_services ?| $3::text[]
+                ORDER BY updated_at DESC
+                """,
+                namespace,
+                since,
+                services,
+            )
+            return [row_to_incident(row) for row in rows]
+
+        # No derivable service (e.g. a cluster-scoped alert like
+        # KubeControllerManagerDown): namespace+service overlap has nothing
+        # to key on, so fall back to matching on alertname alone among
+        # incidents that are themselves service-less — matching on
+        # namespace alone would be unsafe (see interfaces.py), but two
+        # service-less incidents sharing both alertname and (null-safe)
+        # namespace are the same recurring cluster-wide condition.
+        if not alertnames:
             return []
         rows = await self._pool.fetch(
             """
@@ -88,11 +115,12 @@ class PostgresIncidentStore:
             WHERE status = 'open'
               AND affected_namespace IS NOT DISTINCT FROM $1
               AND updated_at >= $2
-              AND affected_services ?| $3::text[]
+              AND affected_services = '[]'::jsonb
+              AND initial_alerts ?| $3::text[]
             ORDER BY updated_at DESC
             """,
             namespace,
             since,
-            services,
+            alertnames,
         )
         return [row_to_incident(row) for row in rows]

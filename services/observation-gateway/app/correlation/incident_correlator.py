@@ -150,7 +150,7 @@ async def correlate_or_create_incident(
         minutes=settings.correlation_window_minutes
     )
     candidates = await incident_store.find_correlation_candidates(
-        namespace=namespace, services=services, since=since
+        namespace=namespace, services=services, since=since, alertnames=alertnames
     )
 
     if candidates:
