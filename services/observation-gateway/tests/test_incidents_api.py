@@ -285,3 +285,108 @@ def test_get_incident_source_status_empty_before_context_collection(client):
     resp = client.get(f"/incidents/{incident.incident_id}/source-status")
     assert resp.status_code == 200
     assert resp.json()["source_status"] == []
+
+
+def test_patch_incident_status_updates_status_and_updated_at_only(client):
+    incident = make_incident(
+        status="open",
+        created_at=datetime(2026, 8, 20, 8, 0, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc),
+    )
+    seed_incident(client, incident)
+
+    resp = client.patch(f"/incidents/{incident.incident_id}/status", json={"status": "resolved"})
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert body["status"] == "resolved"
+    assert datetime.fromisoformat(body["updated_at"].replace("Z", "+00:00")) != incident.updated_at
+    # Everything else about the incident is untouched.
+    assert body["incident_id"] == incident.incident_id
+    assert body["title"] == incident.title
+    assert body["severity"] == incident.severity.value
+    assert body["current_phase"] == incident.current_phase.value
+    assert body["affected_services"] == incident.affected_services
+    assert body["affected_namespace"] == incident.affected_namespace
+    assert body["initial_alerts"] == incident.initial_alerts
+    assert body["source"] == incident.source
+    assert (
+        datetime.fromisoformat(body["created_at"].replace("Z", "+00:00")) == incident.created_at
+    )
+
+    stored = run(client.app.state.incident_store.get(incident.incident_id))
+    assert stored.status.value == "resolved"
+    assert stored.updated_at > incident.updated_at
+
+
+def test_patch_incident_status_to_closed(client):
+    incident = make_incident(status="resolved")
+    seed_incident(client, incident)
+
+    resp = client.patch(f"/incidents/{incident.incident_id}/status", json={"status": "closed"})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "closed"
+
+
+def test_patch_incident_status_404_for_missing_incident(client):
+    resp = client.patch("/incidents/INC-DOES-NOT-EXIST/status", json={"status": "resolved"})
+    assert resp.status_code == 404
+
+
+def test_patch_incident_status_rejects_invalid_status_value(client):
+    incident = make_incident()
+    seed_incident(client, incident)
+
+    resp = client.patch(f"/incidents/{incident.incident_id}/status", json={"status": "bogus"})
+    assert resp.status_code == 422
+
+    stored = run(client.app.state.incident_store.get(incident.incident_id))
+    assert stored.status.value == "open"
+
+
+def test_patch_incident_status_rejects_setting_back_to_open(client):
+    incident = make_incident(status="resolved")
+    seed_incident(client, incident)
+
+    resp = client.patch(f"/incidents/{incident.incident_id}/status", json={"status": "open"})
+    assert resp.status_code == 422
+
+    stored = run(client.app.state.incident_store.get(incident.incident_id))
+    assert stored.status.value == "resolved"
+
+
+def test_patch_incident_status_leaves_evidence_and_observations_untouched(client):
+    incident = make_incident()
+    seed_incident(client, incident)
+
+    obs = Observation.new(
+        source=ObservationSource.ALERTMANAGER,
+        signal_type=SignalType.ALERT,
+        cluster="cloudmart-k3s",
+        signal="HighHTTPErrorRate",
+        service="order-service",
+        correlation=Correlation(incident_id=incident.incident_id),
+    )
+    run(client.app.state.observation_store.save(obs))
+
+    evidence = Evidence(
+        evidence_id="ev-test0003",
+        incident_id=incident.incident_id,
+        type=EvidenceType.METRIC,
+        source=ObservationSource.PROMETHEUS,
+        timestamp=datetime.now(timezone.utc),
+        summary="HTTP 500 rate increased",
+    )
+    run(client.app.state.evidence_store.save(evidence))
+
+    resp = client.patch(f"/incidents/{incident.incident_id}/status", json={"status": "resolved"})
+    assert resp.status_code == 200
+
+    evidence_resp = client.get(f"/incidents/{incident.incident_id}/evidence")
+    assert evidence_resp.status_code == 200
+    assert len(evidence_resp.json()) == 1
+    assert evidence_resp.json()[0]["evidence_id"] == "ev-test0003"
+
+    timeline_resp = client.get(f"/incidents/{incident.incident_id}/timeline")
+    assert timeline_resp.status_code == 200
+    assert len(timeline_resp.json()["timeline"]) == 2

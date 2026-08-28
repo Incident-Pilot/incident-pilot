@@ -82,6 +82,12 @@ def test_ingest_routes_are_protected(configured_client):
 def test_incidents_routes_are_protected(configured_client):
     assert configured_client.get("/incidents").status_code == 401
     assert configured_client.get("/incidents/INC-0001").status_code == 401
+    assert (
+        configured_client.patch(
+            "/incidents/INC-0001/status", json={"status": "resolved"}
+        ).status_code
+        == 401
+    )
 
 
 def test_services_route_is_protected(configured_client):

@@ -3,6 +3,13 @@ GET /incidents, GET /incidents/{id}, GET /incidents/{id}/observations,
 GET /incidents/{id}/evidence, GET /incidents/{id}/timeline — spec
 section 12.
 
+PATCH /incidents/{id}/status is the one exception to this file otherwise
+only serving reads: the Gateway's first human-triggered write, letting a
+dashboard operator mark an incident resolved/closed. It updates exactly
+`status` and `updated_at` — nothing else, and it never deletes or hides
+evidence/observations/timeline entries (retention keeps those visible
+regardless of status) and never triggers anything downstream.
+
 `GET /incidents/{id}` returns a composite view matching spec section 15's
 illustrative incident shape: the incident's own fields, plus a compact
 `observations` (ID list) and `evidence` (summarized) so the response is
@@ -21,9 +28,11 @@ been collected/normalized/persisted upstream. It doesn't rank evidence,
 summarize an incident, or suggest anything.
 """
 
-from typing import List, Optional
+from datetime import datetime, timezone
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 
 from app.api.auth import require_api_key
 from app.api.deps import (
@@ -40,9 +49,17 @@ from app.storage.interfaces import (
     SourceStatusStore,
     TopologyStore,
 )
-from shared.models import Evidence, Incident, Observation
+from shared.models import Evidence, Incident, IncidentStatus, Observation
 
 router = APIRouter(dependencies=[Depends(require_api_key)])
+
+
+class IncidentStatusUpdate(BaseModel):
+    """Request body for PATCH /incidents/{id}/status. Deliberately
+    excludes `"open"` — an incident only ever enters OPEN automatically on
+    creation, never via this human-triggered endpoint."""
+
+    status: Literal["resolved", "closed"]
 
 
 async def _get_incident_or_404(incident_id: str, incident_store: IncidentStore) -> Incident:
@@ -73,6 +90,50 @@ async def get_incident(
     topology_store: TopologyStore = Depends(get_topology_store),
 ):
     incident = await _get_incident_or_404(incident_id, incident_store)
+    observations = await observation_store.list_by_incident(incident_id)
+    evidence = await evidence_store.list_by_incident(incident_id)
+    full_topology = await topology_store.get_all()
+
+    subgraph = {
+        service: full_topology[service]
+        for service in incident.affected_services
+        if service in full_topology
+    }
+
+    return {
+        **incident.model_dump(mode="json"),
+        "observations": [o.observation_id for o in observations],
+        "evidence": [
+            {"id": e.evidence_id, "type": e.type.value, "summary": e.summary}
+            for e in evidence
+        ],
+        "topology": subgraph,
+    }
+
+
+@router.patch("/incidents/{incident_id}/status")
+async def update_incident_status(
+    incident_id: str,
+    body: IncidentStatusUpdate,
+    incident_store: IncidentStore = Depends(get_incident_store),
+    observation_store: ObservationStore = Depends(get_observation_store),
+    evidence_store: EvidenceStore = Depends(get_evidence_store),
+    topology_store: TopologyStore = Depends(get_topology_store),
+):
+    """The Gateway's first human-triggered write: a dashboard operator
+    marking an incident resolved/closed. Pure status-field update — does
+    not touch evidence, observations, or timeline (retention keeps those
+    visible regardless of status) and does not trigger anything
+    downstream."""
+    incident = await _get_incident_or_404(incident_id, incident_store)
+    incident = incident.model_copy(
+        update={
+            "status": IncidentStatus(body.status),
+            "updated_at": datetime.now(timezone.utc),
+        }
+    )
+    await incident_store.save(incident)
+
     observations = await observation_store.list_by_incident(incident_id)
     evidence = await evidence_store.list_by_incident(incident_id)
     full_topology = await topology_store.get_all()
