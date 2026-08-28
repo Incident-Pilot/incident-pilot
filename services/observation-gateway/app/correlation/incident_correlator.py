@@ -17,6 +17,7 @@ either creates or merges into an OPEN incident; nothing here ever changes
 handler only calls it with firing observations).
 """
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from uuid import uuid4
@@ -25,6 +26,8 @@ from app.config.settings import settings
 from app.models.alertmanager import AlertmanagerWebhookPayload
 from app.storage.interfaces import IncidentStore
 from shared.models import Incident, Observation, Severity
+
+logger = logging.getLogger(__name__)
 
 _SEVERITY_RANK = {
     Severity.CRITICAL: 3,
@@ -129,6 +132,19 @@ async def correlate_or_create_incident(
     namespace = _derive_namespace(firing_observations, payload)
     services = _derive_services(firing_observations)
     alertnames = _derive_alertnames(firing_observations)
+
+    if not namespace and not services:
+        # No namespace/service label anywhere in this delivery (e.g. an
+        # absent()-based alert) — correlation has nothing to key on, so this
+        # always creates a standalone incident rather than merging into an
+        # existing one. Not an error, but easy to miss silently: this is the
+        # only trace of it, since the resulting incident's affected_services
+        # is just an empty list indistinguishable from "checked, found none".
+        logger.warning(
+            "incident correlation for alert(s) %s has no derivable namespace "
+            "or service label — creating incident with limited context",
+            alertnames,
+        )
 
     since = datetime.now(timezone.utc) - timedelta(
         minutes=settings.correlation_window_minutes

@@ -153,6 +153,60 @@ def test_resolved_incident_is_not_a_merge_candidate():
     assert len(run(store.list_all())) == 2
 
 
+def test_sparse_alert_with_no_namespace_or_service_still_creates_incident():
+    # Simulates a ServiceDown-style absent() alert: only alertname/severity,
+    # no namespace/service/job/pod label anywhere to derive from.
+    store = InMemoryIncidentStore()
+    sparse_obs = make_observation(
+        namespace=None, service=None, resource=None, signal="ServiceDown",
+        labels={"alertname": "ServiceDown", "severity": "critical"},
+    )
+    sparse_payload = make_payload(
+        groupLabels={"alertname": "ServiceDown"},
+        alerts=[
+            {
+                "status": "firing",
+                "labels": {"alertname": "ServiceDown", "severity": "critical"},
+                "annotations": {},
+                "startsAt": "2026-08-19T09:30:00Z",
+            }
+        ],
+    )
+
+    incident = run(correlate_or_create_incident([sparse_obs], sparse_payload, store))
+
+    assert incident.incident_id.startswith("INC-")
+    assert incident.affected_services == []
+    assert incident.affected_namespace is None
+    assert incident.initial_alerts == ["ServiceDown"]
+    assert len(run(store.list_all())) == 1
+
+
+def test_sparse_alert_logs_degraded_correlation_warning(caplog):
+    store = InMemoryIncidentStore()
+    sparse_obs = make_observation(
+        namespace=None, service=None, resource=None, signal="ServiceDown",
+        labels={"alertname": "ServiceDown", "severity": "critical"},
+    )
+    sparse_payload = make_payload(groupLabels={"alertname": "ServiceDown"})
+
+    with caplog.at_level("WARNING"):
+        run(correlate_or_create_incident([sparse_obs], sparse_payload, store))
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "ServiceDown" in warnings[0].getMessage()
+
+
+def test_well_labeled_alert_does_not_log_degraded_correlation_warning(caplog):
+    store = InMemoryIncidentStore()
+
+    with caplog.at_level("WARNING"):
+        run(correlate_or_create_incident([make_observation()], make_payload(), store))
+
+    assert caplog.records == []
+
+
 def test_multiple_candidates_tie_break_to_most_recently_updated():
     store = InMemoryIncidentStore()
     older = run(correlate_or_create_incident([make_observation()], make_payload(), store))
